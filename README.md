@@ -72,7 +72,7 @@ To build AAB run `apkc build --aab`. Output file will be at `build/app.{apk/aab}
 
 ## Incremental builds
 
-`apkc build --inc` keeps the timestamps of every compiled file in `build/incremental.json` and only recompiles what changed. Deleting a source or resource also removes the artifacts it produced, so stale classes never stay inside the apk. Switching between `--aab` and apk forces a full rebuild, since the whole output changes shape. An edit of `AndroidManifest.xml` forces a link, and that decision is made on its bytes: putting the same content back is not an edit.
+`apkc build --inc` keeps the **content** of every tracked file in `build/incremental.json` (sources, resources, the java `aapt` generates, `jar/`, the manifest, `lib/` and `assets/`) and only recompiles what differs by bytes. Nothing in the build decides by timestamp: an editor or a tool that rewrites a file with the same content costs nothing, and new bytes under an old timestamp (a `cp -p`, a `tar -xp`, a sync) cannot hide a stage, which is the failure an incremental build must never ship. Deleting a source or resource also removes the artifacts it produced, so stale classes never stay inside the apk. Switching between `--aab` and apk forces a full rebuild, since the whole output changes shape. An edit of `AndroidManifest.xml` forces a link, and that decision is made on its bytes: putting the same content back is not an edit. The state file names the shape it holds, so a state written by another `apkc` loses its records and produces everything once instead of guessing.
 
 ### Dependencies are dexed by bucket, and reach the apk as their own dex files
 
@@ -95,9 +95,9 @@ Two honest caveats of the split:
 
 ### The files aapt generates are compared by content
 
-`aapt2 link --java src` rewrites every generated file on every run even when nothing changed, and the fresh mtime would make each of them look like an edit. apkc hashes them before and after the link: identical content keeps its old mtime, so a resource whose text changed does not recompile any source; content that really changed invalidates **all** sources, because `javac` inlines `R.*` constants into the class files and a stale class would keep shipping the old id.
+`aapt2 link --java src` rewrites every generated file on every run even when nothing changed. apkc hashes them before and after the link: identical content is simply not an edit, so a resource whose text changed does not recompile any source; content that really changed invalidates **all** sources, because `javac` inlines `R.*` constants into the class files and a stale class would keep shipping the old id.
 
-Two files are generated, not one: `R.java` for the ids and `Manifest.java`, the old aapt artifact for the `<permission>` elements of the merged manifest, which `aapt2` still writes. Watching only `R.java` left every resource edit recompiling the whole project (measured as 59s instead of 5.5s on a 60 jar project).
+Two files are generated, not one: `R.java` for the ids and `Manifest.java`, the old aapt artifact for the `<permission>` elements of the merged manifest, which `aapt2` still writes. Watching only `R.java` left every resource edit recompiling the whole project (measured as 59s instead of 5.5s on a 60 jar project), and `watch` used to treat the rewritten `Manifest.java` under `src/` as a user edit: a round that linked resources triggered one round after itself for nothing.
 
 ### `aapt2 link` writes its output directory, it does not own it
 
@@ -133,6 +133,20 @@ The same split exposed a bug below API 21 that nothing else could see: the finge
 
 When one of those tools exits 0 its output was discarded. That is exactly the hole a silently dropped class falls through: `androidx.constraintlayout.helper.widget.Carousel` left the apk and the only trace was a warning "Type ... was not found, it is required for ... desugaring". The output of a successful `d8` is now scanned for those two phrases and logged as a warning, and the output of a successful `javac`/`kotlinc` is logged too. Every `d8` call is timed under `[timing]`, including each bucket by name, so a cycle that paid 39s instead of 92s says which bucket did it.
 
+### `lib/` is packed the way the manifest says
+
+`android:extractNativeLibs` is not decoration: `"false"` promises the runtime can map a `.so` straight out of the apk, which only holds when the entry is **stored** (not deflated) and page aligned, while `"true"` — or the attribute being absent — means the package manager unpacks the libraries at install. apkc reads the attribute and packs `lib/` accordingly, asking `zipalign -p` for the page alignment when the libraries are stored. The round says which of the two it did, because the wrong pairing installs and then fails to load the library. Flipping the attribute rewrites those entries even though not one byte of any `.so` moved: an entry is recorded by its bytes *and* its method, and the roster of `lib/` carries the method too.
+
+### Kotlin takes the whole module
+
+`kotlinc` has no per-file incremental mode at the command line, so `--inc` decides **whether** the stage runs, not how much of the module it reads: when a `.kt` moved, the module goes in, with the `.java` sources listed beside it because Kotlin resolves against them without compiling them. Handing over the directory `src` *and* the changed files asked for the same sources twice. Only the `.kt` files are recorded — recording the `.java` here would hide them from `javac`, which runs after.
+
+A project with `.kt` files needs two things the Android SDK does not ship: the compiler on `PATH`, and a `kotlin-stdlib*.jar` in `jar/`, because `android.jar` carries no `kotlin.*`. The build names whichever is missing instead of dying with an empty error or a wall of unresolved references.
+
+### What is still not tracked: who calls whom
+
+Changing the signature of a method in one file does **not** recompile the callers. `javac` is handed only the files whose content moved, and it trusts a `.class` newer than its source, so the build stays green and the apk carries a caller linked against a descriptor that no longer exists: `NoSuchMethodError` on the device. `-sourcepath` was tried and does not help, because javac only pulls in a source when the `.java` is newer than its `.class` — which a timestamp decision cannot answer either. Closing this needs a real dependency graph: which project class references which, read from the constant pool of the compiled classes, so a changed class invalidates the sources that name it. Until then, an API change is a reason to run `apkc build` without `--inc`.
+
 ### One state file, written once, and atomically
 
 `build/incremental.json` tracks 410 files on the demo project, and nine places in the code used to save it, each one rewriting the whole JSON. It is written once, at the end of an incremental build, through `build/incremental.json.tmp` and a rename, so a build that dies cannot leave a half written state file behind. Two checkpoints stay: right after the resource stage and right after the compilers, because a build that aborts later (a duplicated class, a failing `d8`) has already produced classes that the next cycle must know about, or the tree keeps an orphan `.class` that no later run can prune. An idle cycle writes the file zero times.
@@ -161,6 +175,7 @@ One signing option was tried and reverted: `--align-file-size=false` avoids padd
 |---|---|---|
 | nothing (idle) | ~2s | **~0.1s inside apkc**, apk untouched, state file not rewritten |
 | one source file | 3m56s | **18.5s** (javac 5.9s, `d8` app 8.0s, package 0.1s, apksigner 3.9s) — no bucket re-dexed |
+| the same file touched, bytes unchanged | 3m56s | **idle**: no compile, no package, apk left exactly as it was |
 | a resource whose ids did not change | 3m56s | **5.5s** |
 | every jar rewritten with the same bytes | 59s | **under 1s** |
 | one bucket lost (its jars' bytes changed) | one pass over all of them | **one `d8` call**, 23.6s on a small bucket, 31.6s on the same one hot, 92s measured on a large one |
@@ -175,7 +190,7 @@ One signing option was tried and reverted: `--align-file-size=false` avoids padd
 
 These are one device heating up, so the same cycle measured 18.5s and 28.3s on two runs ten minutes apart, and `javac` on the bigger demo moved between 8.4s and 11.9s for identical work. Read the rows as ranges, and read `[timing]` on your own project before believing any single number.
 
-The last two rows are the ones that matter: an incremental build that answers fast and ships the wrong bytes is worse than a slow one. Every stage that decides by content (the generated java files, `jar/`, the manifest) is decided by a sha1 of those bytes, so a timestamp can neither force work that is not needed nor hide work that is. What still costs a full pass does so on purpose: a new resource id invalidates every source (`javac` inlines `R.*` into the class files), and a `minSdkVersion` change invalidates every compiled constant at the new api level, the dependency buckets included. A manifest edit that changes neither pays only the link and the signature.
+The last two rows are the ones that matter: an incremental build that answers fast and ships the wrong bytes is worse than a slow one. Every stage decides by content now — the sources, the resources, the java `aapt` generates, `jar/`, the manifest, `lib/` and `assets/` — with a sha1 of those bytes, so a timestamp can neither force work that is not needed nor hide work that is. What still costs a full pass does so on purpose: a new resource id invalidates every source (`javac` inlines `R.*` into the class files), and a `minSdkVersion` change invalidates every compiled constant at the new api level, the dependency buckets included. A manifest edit that changes neither pays only the link and the signature.
 
 Building the six buckets the first time costs 4m38s; `apkc clean` deletes them with `build/`. The first run after upgrading is one full rebuild, because the old state file has neither `dexInputs` nor `manifestDigest` yet and the per-jar cache of the previous layout is not a bucket.
 
@@ -195,7 +210,7 @@ $ apkc watch --inc --run       # and install + follow the app after each rebuild
 $ apkc watch --inc --run --rish # install through the Shizuku shell instead of adb
 ```
 
-`watch` starts one `apkc` process per round, so a build that fails leaves the watcher running and waiting for the next change. Without `--run` it never touches the device. The `build/` directory, dot directories and the generated `R.java` are ignored, because they are apkc output.
+`watch` starts one `apkc` process per round, so a build that fails leaves the watcher running and waiting for the next change, and every round logs that it started — without that line the log ends right after "a file changed", which looks exactly like a watcher that lost the event. Without `--run` it never touches the device, and a plain build is never killed halfway: changes that land while a round runs are coalesced into one round after it, not replayed one per queued event. With `--run` the round replaces the running app at once, and it is killed by process **group**, because the round's `adb logcat` or `rish` grandchild shares the terminal and would otherwise keep streaming over the next round. The `build/` directory, dot directories and the generated `R.java` and `Manifest.java` are ignored, because they are apkc output.
 
 On Android/Termux this relies on inotify, which reports changes for projects under `$HOME` (Termux private storage). Projects on shared storage (`/sdcard`) do not deliver events.
 
@@ -203,7 +218,11 @@ On Android/Termux this relies on inotify, which reports changes for projects und
 
 `apkc run --rish` installs and follows the app through [Shizuku](https://shizuku.rikka.app/)'s shell instead of the Android SDK platform tools. The apk is piped through the shell's stdin into `/data/local/tmp` and installed with `pm install -r`, so app data survives each round and Termux does not need the shared storage permission. If `rish` is not available the run stops there and says so.
 
-One caveat worth knowing: `rish` exits 0 whatever the device command did, so apkc reads the reply text and aborts on a `Failure` from `pm install` or an `Error` from `am start` instead of reporting a successful run.
+One caveat worth knowing: `rish` exits 0 whatever the device command did, so apkc reads the reply text and aborts on a `Failure` from `pm install` or an `Error` from `am start` instead of reporting a successful run. `adb` answers the same way about the launch: `am start -W` reports its outcome in the text.
+
+### The log of an app that died before it could be followed
+
+Both backends used to gate the log on a live pid: an app that crashes in `onCreate` has no pid by the time `pidof` runs, and the user got "couldn't get the pid" while the `FATAL EXCEPTION` that explained it stayed in the device buffer. `run` now takes a timestamp of the device clock **before** the launch (it does not clear the buffer), and asks for the app's log whatever `pidof` answers: the crash buffer first, then the lines of the main buffer that belong to the package — by its live pid, by the pid the `ActivityManager` names next to it, or by continuing one of those records, which is what keeps a stack trace readable. The same report runs when the stream ends and the process is gone, which is the case `watch --run` hits constantly: the round that follows installs over the app, so without it a crash between rounds was simply lost. If the app is not there, the run says so and prints what the device still holds; if the buffer holds nothing, it says that too.
 
 ## Verifying
 
