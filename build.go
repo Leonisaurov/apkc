@@ -30,6 +30,7 @@ const depsCacheKeep = 2 * depsBucketsMax
 type buildOpts struct {
 	useAAB      bool
 	incremental bool
+	coreLibrary bool
 	keyStore    string
 	storePass   string
 	keyAlias    string
@@ -43,6 +44,7 @@ type buildOpts struct {
 type buildFlags struct {
 	useAAB      *bool
 	incremental *bool
+	coreLibrary *bool
 	keyStore    *string
 	storePass   *string
 	keyAlias    *string
@@ -57,6 +59,7 @@ func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
 		f.useAAB = set.Bool("aab", false, "build an app bundle instead of an apk")
 	}
 	f.incremental = set.Bool("inc", false, "use the incremental build system")
+	f.coreLibrary = set.Bool("core-library", false, "let d8 dex java.* classes (core library desugaring)")
 	f.keyStore = set.String("keystore", keyStorePath, "path to the keystore")
 	f.storePass = set.String("storepass", "android", "keystore password")
 	f.keyAlias = set.String("keyalias", "androiddebugkey", "key alias to use")
@@ -67,6 +70,7 @@ func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
 func (f buildFlags) opts() buildOpts {
 	o := buildOpts{
 		incremental: *f.incremental,
+		coreLibrary: *f.coreLibrary,
 		keyStore:    *f.keyStore,
 		storePass:   *f.storePass,
 		keyAlias:    *f.keyAlias,
@@ -195,7 +199,7 @@ func _build(o buildOpts) {
 		if class, jar, dup := shadowedClass(jars); dup {
 			LogF("build", "Type "+class+" is defined multiple times", "the project and "+jar+" both hold it")
 		}
-		depDexes, depStale = dexDeps(api, jars, digests)
+		depDexes, depStale = dexDeps(api, o.coreLibrary, jars, digests)
 	}
 	// two different decisions that used to be one flag: whether the bundle has to take
 	// the dexes of a changed dependency set, and whether the classes of the project
@@ -208,7 +212,7 @@ func _build(o buildOpts) {
 	appStale := !o.incremental || firstRun || typeChanged || compSource || classStale ||
 		apiChanged || (depChanged && !splitDeps) || dexMissing
 	if appStale {
-		bundleJava(api, jars, splitDeps, classes)
+		bundleJava(api, o.coreLibrary, jars, splitDeps, classes)
 		if o.incremental && len(classes) > 0 {
 			// recorded only when a dex was really written: an empty src/ produces
 			// nothing to attribute to this api level
@@ -260,7 +264,7 @@ func _build(o buildOpts) {
 			bundleSha, _ = fileSHA1(packed)
 		}
 		apkOk := exists(filepath.Join("build", "app.apk"))
-		if !o.incremental || !apkOk || bundleSha != DataTable.BundleSha1 {
+		if mustPackageAgain(o.incremental, apkOk, bundleSha, DataTable.BundleSha1) {
 			alignAPK(libs.stored)
 			signAPK(o.keyStore, o.storePass, o.keyAlias)
 			if o.incremental {
@@ -277,6 +281,15 @@ func _build(o buildOpts) {
 	if o.incremental {
 		saveTable()
 	}
+}
+
+// mustPackageAgain answers whether zipalign and apksigner have to run. Under
+// --inc only the bytes of the package decide. Without --inc the answer is always
+// yes, and that half is a contract rather than waste: a caller of the plain
+// build has no other way to know the build ran, because a wrapper around it
+// exits 0 even when apkc failed, so the apk getting newer IS the signal.
+func mustPackageAgain(incremental, apkOk bool, bundleSha, recordedSha string) bool {
+	return !incremental || !apkOk || bundleSha != recordedSha
 }
 
 // clean simply deletes the build dir
@@ -555,11 +568,17 @@ func compileJava(incremental bool) bool {
 
 // d8Args are the flags every d8 invocation needs, shared by the per jar cache
 // and by the merge: desugaring differently in the two stages would produce a dex
-// that no single pass would have produced.
-func d8Args(api int) []string {
+// that no single pass would have produced. coreLibrary is off by default because
+// it lets a dependency carry java.* classes: right for the desugared core
+// libraries, wrong for anything else, since d8 then stops telling you a package
+// collides with the platform.
+func d8Args(api int, coreLibrary bool) []string {
 	args := []string{"--lib", androidJar, "--release"}
 	if api > 0 {
 		args = append(args, "--min-api", strconv.Itoa(api))
+	}
+	if coreLibrary {
+		args = append(args, "--core-library")
 	}
 	return args
 }
@@ -591,14 +610,14 @@ func classpathArgs(skip map[string]bool, jars []string) []string {
 // classes is the list build/classes was walked into, handed in so the tree is scanned
 // once per build instead of once here and once by the caller that decides whether this
 // call is needed at all.
-func bundleJava(api int, jars []string, depsSplit bool, classes []string) {
+func bundleJava(api int, coreLibrary bool, jars []string, depsSplit bool, classes []string) {
 	defer timeIt("d8 app")()
 	if len(classes) < 1 {
 		return
 	}
 
 	inputs := classes
-	args := d8Args(api)
+	args := d8Args(api, coreLibrary)
 	if depsSplit {
 		args = append(args, classpathArgs(nil, jars)...)
 	} else {
@@ -697,7 +716,7 @@ func auxRoster(libStored bool) (string, map[string]string) {
 // bucket and not the lot. The cache holds several files per bucket because d8 splits
 // by itself above the 64K method limit. It reports whether it had to run d8 for any
 // bucket, which is when the dependencies really changed on disk.
-func dexDeps(api int, jars []string, digests []string) ([]string, bool) {
+func dexDeps(api int, coreLibrary bool, jars []string, digests []string) ([]string, bool) {
 	// the whole dependency pass, so an idle build that answered every bucket from the
 	// cache stays under the threshold of timeIt and never logs
 	defer timeIt("d8 deps")()
@@ -728,7 +747,7 @@ func dexDeps(api int, jars []string, digests []string) ([]string, bool) {
 				memberDigests = append(memberDigests, uniqueDigests[i])
 			}
 		}
-		wrote, ran := dexBucket(api, memberJars, memberDigests, uniqueJars)
+		wrote, ran := dexBucket(api, coreLibrary, memberJars, memberDigests, uniqueJars)
 		dexes = append(dexes, wrote...)
 		produced = produced || ran
 	}
@@ -773,7 +792,7 @@ func bucketOf(jar string, buckets int) int {
 // d8 is not handed them again to produce nothing. allJars is every jar of the set, of
 // which the ones that are not in this bucket become the classpath: a class desugaring
 // against a type another bucket holds would otherwise be dropped by d8.
-func dexBucket(api int, jars []string, digests []string, allJars []string) ([]string, bool) {
+func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJars []string) ([]string, bool) {
 	if len(jars) < 1 {
 		return nil, false
 	}
@@ -805,7 +824,7 @@ func dexBucket(api int, jars []string, digests []string, allJars []string) ([]st
 		skip[jar] = true
 	}
 	LogI("build", "dexing dependencies")
-	args := d8Args(api)
+	args := d8Args(api, coreLibrary)
 	args = append(args, classpathArgs(skip, allJars)...)
 	args = append(args, "--output", dir)
 	args = append(args, jars...)

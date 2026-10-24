@@ -98,3 +98,22 @@ func TestReusePlanTakesANameOnlyOnce(t *testing.T) {
 		t.Error("the same copy cannot answer two entries of one name")
 	}
 }
+
+// TestPlainBuildAlwaysRewritesTheApk is a contract, not an optimization detail: a
+// caller of `apkc build` without --inc judges the build by the apk getting newer,
+// because the wrapper around it exits 0 even when apkc failed. Under --inc the
+// package bytes decide, and an identical package must not pay two JVMs.
+func TestPlainBuildAlwaysRewritesTheApk(t *testing.T) {
+	if !mustPackageAgain(false, true, "same", "same") {
+		t.Error("a build without --inc repackages even when the bytes match")
+	}
+	if mustPackageAgain(true, true, "same", "same") {
+		t.Error("an incremental round with the same package has nothing to align or sign again")
+	}
+	if !mustPackageAgain(true, true, "new", "old") {
+		t.Error("different package bytes must reach the signer")
+	}
+	if !mustPackageAgain(true, false, "same", "same") {
+		t.Error("no apk on disk must be aligned and signed, digest or no digest")
+	}
+}

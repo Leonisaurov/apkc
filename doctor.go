@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -19,7 +20,7 @@ var (
 	javacPath   string
 
 	// kotlin sdk paths
-	kotlincPath   string
+	kotlincPath string
 
 	// android sdk paths
 	sdkPath       string
@@ -53,6 +54,25 @@ func doctor() {
 	LogI("doctor", "apksigner", apksignerPath)
 
 	LogI("doctor", "android jar", androidJar)
+
+	// what a build and a run need that no SDK search can answer: the key the
+	// packages are signed with, and which of the two device backends is reachable
+	if exists(keyStorePath) {
+		LogI("doctor", "keystore", keyStorePath)
+	} else {
+		LogW("doctor", "no debug keystore at", keyStorePath, "- nothing can be signed until it exists")
+	}
+
+	if _, err := exec.LookPath(adbPath); err == nil {
+		LogI("doctor", "adb", adbPath)
+	} else {
+		LogD("doctor", "no adb: apkc run without --rish cannot reach a device")
+	}
+	if _, err := exec.LookPath("rish"); err == nil {
+		LogI("doctor", "rish", "on PATH (Shizuku shell: apkc run --rish)")
+	} else {
+		LogD("doctor", "no rish: start the Shizuku shell to run and watch without adb")
+	}
 }
 
 // findSDKs finds Android SDK, Java SDK and paths of other required binaries

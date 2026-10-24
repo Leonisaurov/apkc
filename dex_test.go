@@ -4,9 +4,53 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// TestD8ArgsKnowTheApiAndTheCoreLibrary pins the two flags that decide what every
+// d8 call produces. Without --min-api d8 assumes API 1 and rewrites every lambda
+// of every dependency; --core-library is off unless asked, because with it on d8
+// stops reporting a dependency that collides with the platform packages.
+func TestD8ArgsKnowTheApiAndTheCoreLibrary(t *testing.T) {
+	bare := strings.Join(d8Args(0, false), " ")
+	if strings.Contains(bare, "--min-api") || strings.Contains(bare, "--core-library") {
+		t.Errorf("an api level of 0 and no core library must add nothing to --lib and --release: %v", bare)
+	}
+
+	withAPI := strings.Join(d8Args(26, false), " ")
+	if !strings.Contains(withAPI, "--min-api 26") {
+		t.Errorf("the api level of the manifest must reach d8: %v", withAPI)
+	}
+
+	both := strings.Join(d8Args(21, true), " ")
+	if !strings.Contains(both, "--core-library") {
+		t.Errorf("--core-library must reach the call: %v", both)
+	}
+	if !strings.Contains(both, "--min-api 21") {
+		t.Errorf("the two flags are independent of each other: %v", both)
+	}
+	if strings.Contains(strings.Join(d8Args(21, false), " "), "--core-library") {
+		t.Error("core library desugaring is opt-in, not a default")
+	}
+}
+
+// TestDexEntryNamesNumberTheApkDexes: ART opens classes.dex and then classes2.dex
+// and on. A name outside that series is an entry the runtime never loads, which is
+// how a dependency ends up compiled, dexed, and missing from the installed app.
+func TestDexEntryNamesNumberTheApkDexes(t *testing.T) {
+	want := []string{"classes.dex", "classes2.dex", "classes3.dex", "classes4.dex"}
+	for i, expected := range want {
+		if got := dexEntryName(i + 1); got != expected {
+			t.Errorf("dexEntryName(%d) = %q, want %q", i+1, got, expected)
+		}
+	}
+
+	if got := dexEntryName(0); got != "classes.dex" {
+		t.Errorf("an index below the first dex must still name a dex ART opens, got %q", got)
+	}
+}
 
 // The apk numbers its dex files from one. Getting that numbering wrong is not a
 // warning: a collision over classes.dex silently drops whichever dex the bundle

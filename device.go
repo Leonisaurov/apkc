@@ -459,6 +459,9 @@ func watch() {
 	if o.incremental {
 		args = append(args, "--inc")
 	}
+	if o.coreLibrary {
+		args = append(args, "--core-library")
+	}
 	if *useRish {
 		args = append(args, "--rish")
 	}

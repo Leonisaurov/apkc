@@ -91,7 +91,9 @@ Two honest caveats of the split:
 
 ### d8 knows the api level
 
-`d8` gets `--min-api` from the manifest's `minSdkVersion`. Without it `d8` assumes API 1 and desugars every lambda and default method of every dependency: on the same project that was 153s for the dex stage instead of 125s, and a bigger dex. A manifest without `uses-sdk` keeps the old behaviour (`d8` default), and `--no-desugaring` is deliberately not passed: core library desugaring would silently disappear with it.
+`d8` gets `--min-api` from the manifest's `minSdkVersion`. Without it `d8` assumes API 1 and desugars every lambda and default method of every dependency: on the same project that was 153s for the dex stage instead of 125s, and a bigger dex. A manifest without `uses-sdk` keeps the old behaviour (`d8` default).
+
+`--core-library` is opt-in and off by default. It is the flag a desugared core library jar (the `java.*` ones) needs to dex at all, and with it on `d8` also stops reporting a dependency whose classes collide with the platform, which is why it is not a default. Every `d8` call takes it, the project and the buckets alike: desugaring one stage differently from the other would produce a dex that no single pass would have produced.
 
 ### The files aapt generates are compared by content
 
