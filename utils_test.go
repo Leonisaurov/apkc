@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -296,5 +297,56 @@ func TestPruneDeletedJarFollowsTheDexLayout(t *testing.T) {
 				t.Error("record of the deleted jar must be dropped")
 			}
 		})
+	}
+}
+
+func TestKotlinShortcomingsNamesOnlyWhatIsActuallyMissing(t *testing.T) {
+	// os.Args[0] is the test binary: a real executable, so "compiler present" is
+	// answered without depending on what this machine happens to have installed
+	present := os.Args[0]
+	absent := "apkc-no-such-compiler"
+
+	if got := kotlinShortcomings(present, []string{"jar/gson-2.10.1.jar", "jar/kotlin-stdlib-2.0.21.jar"}); len(got) != 0 {
+		t.Errorf("a project that has both was reported as lacking %v", got)
+	}
+
+	got := kotlinShortcomings(present, []string{"jar/gson-2.10.1.jar"})
+	if len(got) != 1 || !strings.Contains(got[0], "kotlin-stdlib") {
+		t.Errorf("the missing stdlib was reported as %v", got)
+	}
+
+	got = kotlinShortcomings(absent, []string{"jar/kotlin-stdlib-2.0.21.jar"})
+	if len(got) != 1 || !strings.Contains(got[0], "PATH") {
+		t.Errorf("the missing compiler was reported as %v", got)
+	}
+
+	got = kotlinShortcomings(absent, nil)
+	if len(got) != 2 {
+		t.Errorf("a project missing both was reported as %v, want two names", got)
+	}
+}
+
+func TestClasspathUsesThePlatformSeparator(t *testing.T) {
+	entries := []string{"android.jar", "build/classes", "jar/a.jar", "jar/b.jar"}
+	want := strings.Join(entries, string(filepath.ListSeparator))
+	if got := classpath(entries); got != want {
+		t.Errorf("classpath = %q, want %q", got, want)
+	}
+
+	if got := classpath([]string{"only"}); got != "only" {
+		t.Errorf("one entry must carry no separator, got %q", got)
+	}
+
+	// every jar of the project has to survive the join: a classpath that drops a
+	// dependency compiles and then crashes at runtime
+	jars := []string{"jar/a.jar", "jar/b.jar"}
+	joined := classpath(append([]string{"android.jar"}, jars...))
+	for _, jar := range jars {
+		if !strings.Contains(joined, jar) {
+			t.Errorf("%s is not in the classpath %q", jar, joined)
+		}
+	}
+	if strings.Contains(joined, "android.jar"+string(filepath.ListSeparator)+"android.jar") {
+		t.Error("android.jar must be listed once")
 	}
 }

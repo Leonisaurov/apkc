@@ -417,6 +417,30 @@ func settleGenJava(before map[string]genRecord) bool {
 	return changed
 }
 
+// kotlinShortcomings names what a project with .kt files still lacks. Neither
+// piece comes with the Android SDK: the compiler is its own install, and the
+// stdlib is a jar the project has to carry in jar/, because android.jar does not
+// contain kotlin.*. Without them the first thing the user sees is a wall of
+// unresolved references, or an empty failure from a compiler that is not there.
+func kotlinShortcomings(compiler string, jars []string) []string {
+	missing := []string{}
+	if _, err := exec.LookPath(compiler); err != nil {
+		missing = append(missing, "kotlinc is not on PATH (looked for as "+compiler+")")
+	}
+
+	stdlib := false
+	for _, jar := range jars {
+		if strings.Contains(strings.ToLower(filepath.Base(jar)), "kotlin-stdlib") {
+			stdlib = true
+			break
+		}
+	}
+	if !stdlib {
+		missing = append(missing, "no kotlin-stdlib*.jar in jar/")
+	}
+	return missing
+}
+
 func compileKotlin(incremental bool) bool {
 	defer timeIt("kotlinc")()
 	kotlins, _ := getFiles("src", "kt", incremental)
@@ -424,12 +448,15 @@ func compileKotlin(incremental bool) bool {
 		return false
 	}
 
+	// the classpath always needs every jar, not only the ones that changed
+	jars := allJars()
+	for _, lack := range kotlinShortcomings(kotlincPath, jars) {
+		LogW("kotlinc", lack, "needed to compile", len(kotlins), "kotlin files")
+	}
+
 	LogI("build", "compiling kotlin files")
 
-	// the classpath always needs every jar, not only the ones that changed
-	jars := strings.Join(allJars(), ":")
-
-	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", androidJar + ":" + jars, "src"}
+	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", classpath(append([]string{androidJar}, jars...)), "src"}
 	args = append(args, kotlins...)
 	cmd := exec.Command(kotlincPath, args...)
 	out, err := cmd.CombinedOutput()
@@ -452,6 +479,13 @@ func allJars() []string {
 	return jars
 }
 
+// classpath joins the entries the way the tool being called reads them, which is
+// not always a colon: javac and kotlinc take the platform path list separator,
+// and a hardcoded ":" leaves every dependency unreachable on Windows.
+func classpath(entries []string) string {
+	return strings.Join(entries, string(filepath.ListSeparator))
+}
+
 // compileJava compiles java files in src dir and uses jar files in the jar dir as classpath
 func compileJava(incremental bool) bool {
 	defer timeIt("javac")()
@@ -462,9 +496,9 @@ func compileJava(incremental bool) bool {
 	LogD("Incremental", "javac recompiles", len(javas), "java files")
 	LogI("build", "compiling java files")
 
-	jars := strings.Join(allJars(), ":")
+	jars := allJars()
 
-	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", androidJar + ":" + filepath.Join("build", "classes") + ":" + jars}
+	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", classpath(append([]string{androidJar, filepath.Join("build", "classes")}, jars...))}
 	args = append(args, javas...)
 	cmd := exec.Command(javacPath, args...)
 	out, err := cmd.CombinedOutput()
