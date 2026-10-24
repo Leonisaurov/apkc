@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"runtime"
 )
 
 // build compiles all the source code and bundles into apk file with dependencies
@@ -84,6 +84,14 @@ func compileRes() {
 func bundleRes(useAAB bool) {
 	LogI("build", "bundling resources")
 
+	// aapt2 --output-to-dir does not create res subdirectories on Windows
+	entries, _ := os.ReadDir("res")
+	for _, e := range entries {
+		if e.IsDir() {
+			os.MkdirAll(filepath.Join("build", "res", e.Name()), 0755)
+		}
+	}
+
 	flats := getFiles("build/flats", ".flat")
 	args := []string{"link", "-I", androidJar, "--manifest", "AndroidManifest.xml", "-o", "build", "--java", "src", "--output-to-dir"}
 	if useAAB {
@@ -105,9 +113,7 @@ func compileKotlin() {
 
 	LogI("build", "compiling kotlin files")
 
-	jars := strings.Join(getFiles("jar", "jar"), ":")
-
-	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", androidJar + ":" + jars, "src"}
+	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", joinPaths(append([]string{androidJar}, getFiles("jar", "jar")...)...), "src"}
 	args = append(args, kotlins...)
 	cmd := exec.Command(kotlincPath, args...)
 	out, err := cmd.CombinedOutput()
@@ -121,9 +127,9 @@ func compileJava() {
 	LogI("build", "compiling java files")
 
 	javas := getFiles("src", "java")
-	jars := strings.Join(getFiles("jar", "jar"), ":")
 
-	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", androidJar + ":" + filepath.Join("build", "classes") + ":" + jars}
+	classpath := append([]string{androidJar, filepath.Join("build", "classes")}, getFiles("jar", "jar")...)
+	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", joinPaths(classpath...)}
 	args = append(args, javas...)
 	cmd := exec.Command(javacPath, args...)
 	out, err := cmd.CombinedOutput()
@@ -142,7 +148,14 @@ func bundleJava() {
 	args := []string{"--lib", androidJar, "--release", "--output", "build"}
 	args = append(args, classes...)
 	args = append(args, jars...)
-	cmd := exec.Command(d8Path, args...)
+	// on Windows d8 is a .bat wrapper that cannot be exec'd directly
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		javaArgs := append([]string{"-cp", filepath.Join(toolsPath, "lib", "d8.jar"), "com.android.tools.r8.D8"}, args...)
+		cmd = exec.Command(javaExe(), javaArgs...)
+	} else {
+		cmd = exec.Command(d8Path, args...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		LogF("build", string(out), d8Path, args)
@@ -199,7 +212,8 @@ func buildBundle(useAAB bool) {
 		if err != nil {
 			LogF("build", err)
 		}
-		addFileToZip(f, r, true)
+		// zip entries must use forward slashes even on Windows
+		addFileToZip(f, filepath.ToSlash(r), true)
 	}
 
 	files = getFiles("assets", "")
@@ -207,7 +221,7 @@ func buildBundle(useAAB bool) {
 		LogI("build", "bundling assets")
 	}
 	for _, f := range files {
-		addFileToZip(f, f, true)
+		addFileToZip(f, filepath.ToSlash(f), true)
 	}
 
 	files = getFiles("lib", "")
@@ -215,7 +229,7 @@ func buildBundle(useAAB bool) {
 		LogI("build", "bundling native libs")
 	}
 	for _, f := range files {
-		addFileToZip(f, f, true)
+		addFileToZip(f, filepath.ToSlash(f), true)
 	}
 
 	err = w.Close()

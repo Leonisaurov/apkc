@@ -10,6 +10,25 @@ import (
 	"strings"
 )
 
+// joinPaths joins non-empty classpath entries with the OS-specific separator.
+func joinPaths(parts ...string) string {
+	nonEmpty := []string{}
+	for _, p := range parts {
+		if p != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	return strings.Join(nonEmpty, string(os.PathListSeparator))
+}
+
+// javaExe locates the java binary for running build-tools jars on Windows.
+func javaExe() string {
+	if javaBinPath != "" {
+		return filepath.Join(javaBinPath, "java")
+	}
+	return "java"
+}
+
 // prompt prints the text and returns the string user entered. if empty then defaultValue is returned.
 func prompt(text string, defaultValue string) string {
 	fmt.Print(text)

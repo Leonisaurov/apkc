@@ -3,6 +3,7 @@ package main
 import (
 	"os/exec"
 	"path/filepath"
+	"runtime"
 )
 
 // alignAPK does zipalign
@@ -22,7 +23,15 @@ func alignAPK() {
 func signAPK(keyStore, storePass, keyAlias *string) {
 	LogI("build", "signing app")
 
-	cmd := exec.Command(apksignerPath, "sign", "--ks-pass", "pass:"+*storePass, "--ks", *keyStore, "--ks-key-alias", *keyAlias, filepath.Join("build", "app.apk"))
+	args := []string{"sign", "--ks-pass", "pass:" + *storePass, "--ks", *keyStore, "--ks-key-alias", *keyAlias, filepath.Join("build", "app.apk")}
+	// on Windows apksigner is a .bat wrapper that cannot be exec'd directly
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		javaArgs := append([]string{"-jar", filepath.Join(toolsPath, "lib", "apksigner.jar")}, args...)
+		cmd = exec.Command(javaExe(), javaArgs...)
+	} else {
+		cmd = exec.Command(apksignerPath, args...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		LogF("build", string(out))
