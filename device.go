@@ -247,8 +247,9 @@ func isGenerated(path string) bool {
 			return true
 		}
 	}
-	// bundleRes writes R.java inside src/, it is a product of the resources
-	return filepath.Base(path) == "R.java"
+	// bundleRes writes R.java and Manifest.java inside src/, both are products
+	// of the resource link, not sources of the project
+	return genJavaFile(filepath.Base(path))
 }
 
 func addRecursive(w *fsnotify.Watcher, root string) error {
