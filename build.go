@@ -66,7 +66,7 @@ func _build(o buildOpts) {
 	// API 1 and rewrites every lambda of every dependency
 	api := manifestMinAPI()
 
-	var settedType, resStale, classStale bool
+	var settedType, resStale, classStale, manifestStale bool
 	firstRun := false
 	if o.incremental {
 		// without any record the whole build dir must be treated as missing,
@@ -84,15 +84,16 @@ func _build(o buildOpts) {
 		LogI("Diagnostic", "Detected proyect type changed.", "Rebuilding.")
 	}
 
-	// the manifest holds the package name and the resource ids, so every
-	// resource and source has to be recompiled when it changes
+	// The manifest is an input of the link and of nothing else. `aapt2 compile`
+	// turns every resource file into a flat before the package name or a resource
+	// id exists, so a new versionName or a declared permission does not
+	// invalidate a single flat. The link is still forced, and what it rewrites
+	// besides the merged manifest it embeds is R.java and Manifest.java under src/,
+	// which settleGenJava compares by content: the sources pay javac only when a
+	// constant really changed. Marking every flat and source changed here used to
+	// cost a whole compile and javac pass over a `versionName` bump.
 	if o.incremental && manifestChanged() {
-		_, unchanged := getFiles("res", "", true)
-		markAsChanged(unchanged)
-		_, unchanged = getFiles("src", "kt", true)
-		markAsChanged(unchanged)
-		_, unchanged = getFiles("src", "java", true)
-		markAsChanged(unchanged)
+		manifestStale = true
 	}
 
 	// an intermediate deleted by hand must be produced again, no matter what
@@ -112,7 +113,7 @@ func _build(o buildOpts) {
 	if o.incremental && compRes {
 		saveTable()
 	}
-	if !o.incremental || firstRun || settedType || compRes || resStale || resMissing {
+	if !o.incremental || firstRun || settedType || compRes || resStale || resMissing || manifestStale {
 		// the files aapt generates were rewritten: the sources that read R.*
 		// constants have to go through javac again, because javac inlines them
 		// into the class files
@@ -182,7 +183,7 @@ func _build(o buildOpts) {
 	}
 
 	needBundle := !o.incremental || firstRun || settedType || compRes || compSource || resStale || classStale ||
-		depChanged || auxStale || resMissing || dexMissing || !exists("build/bundle.zip")
+		manifestStale || depChanged || auxStale || resMissing || dexMissing || !exists("build/bundle.zip")
 	if needBundle {
 		buildBundle(o.useAAB, depDexes, auxDigests)
 		if o.incremental {
