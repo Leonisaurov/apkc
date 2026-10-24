@@ -305,6 +305,14 @@ func bundleRes(useAAB bool, incremental bool) bool {
 	}
 
 	LogI("build", "bundling resources")
+	// aapt2 link --output-to-dir does not clean the directory it writes: a resource
+	// file that disappeared from res/ keeps its compiled copy under build/res, and
+	// the bundle plans every file it finds there, so a deleted (or renamed) drawable
+	// used to stay inside the apk with no entry in the resource table and no constant
+	// in R.java. The directory is nothing but the output of this call, so it is
+	// emptied right before it: an unchanged resource is written again with the same
+	// bytes, so the bundle still reuses its entry.
+	os.RemoveAll(filepath.Join("build", "res"))
 	args := []string{"link", "-I", androidJar, "--manifest", "AndroidManifest.xml", "-o", "build", "--java", "src", "--output-to-dir"}
 	if useAAB {
 		args = append(args, "--proto-format")
