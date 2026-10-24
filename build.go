@@ -99,9 +99,9 @@ func _build(o buildOpts) {
 	// id exists, so a new versionName or a declared permission does not
 	// invalidate a single flat. The link is still forced, and what it rewrites
 	// besides the merged manifest it embeds is R.java and Manifest.java under src/,
-	// which settleGenJava compares by content: the sources pay javac only when a
-	// constant really changed. Marking every flat and source changed here used to
-	// cost a whole compile and javac pass over a `versionName` bump.
+	// compared by content like any other tracked file: the sources pay javac only
+	// when a constant really changed. Marking every flat and source changed here
+	// used to cost a whole compile and javac pass over a `versionName` bump.
 	if o.incremental && manifestChanged() {
 		manifestStale = true
 	}
@@ -312,7 +312,7 @@ func bundleRes(useAAB bool, incremental bool) bool {
 		return false
 	}
 
-	var before map[string]genRecord
+	var before map[string]string
 	if incremental {
 		before = snapshotGenJava()
 	}
@@ -340,13 +340,7 @@ func bundleRes(useAAB bool, incremental bool) bool {
 	if !incremental {
 		return false
 	}
-	return settleGenJava(before)
-}
-
-// genRecord is what a file aapt generates looked like before the link rewrote it.
-type genRecord struct {
-	digest  string
-	modTime time.Time
+	return genJavaChanged(before)
 }
 
 // genJavaFile names what aapt2 link writes into the java output dir. R.java holds
@@ -357,9 +351,10 @@ func genJavaFile(name string) bool {
 	return name == "R.java" || name == "Manifest.java"
 }
 
-// snapshotGenJava records every file aapt generates under src/ before the link.
-func snapshotGenJava() map[string]genRecord {
-	records := map[string]genRecord{}
+// snapshotGenJava records the content of every file aapt generates under src/,
+// before the link rewrites them.
+func snapshotGenJava() map[string]string {
+	records := map[string]string{}
 	filepath.Walk("src", func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !genJavaFile(info.Name()) {
 			return nil
@@ -368,18 +363,18 @@ func snapshotGenJava() map[string]genRecord {
 		if err != nil {
 			return nil
 		}
-		records[path] = genRecord{digest: digest, modTime: info.ModTime()}
+		records[path] = digest
 		return nil
 	})
 	return records
 }
 
-// settleGenJava undoes the damage of aapt2 rewriting files that did not change:
-// link rewrites all of them on every run, and the fresh mtime would make every one
-// of them look like an edit to the incremental build. Content that really changed
-// is left alone and reported, because then the constants are different and every
-// source using them must be recompiled.
-func settleGenJava(before map[string]genRecord) bool {
+// genJavaChanged reports whether the link wrote different constants. Content is
+// the only thing that can answer it: aapt2 rewrites every one of these files on
+// every run, and the ones whose bytes are identical must not look like an edit,
+// while a real change invalidates every source, because javac inlines the R.*
+// constants into the class files and a stale class would keep shipping an old id.
+func genJavaChanged(before map[string]string) bool {
 	seen := map[string]bool{}
 	changed := false
 
@@ -397,13 +392,9 @@ func settleGenJava(before map[string]genRecord) bool {
 		case !existed:
 			LogD("Incremental", "aapt produced a new file", path)
 			changed = true
-		case old.digest != digest:
+		case old != digest:
 			LogD("Incremental", "aapt changed the content of", path)
 			changed = true
-		default:
-			if err := os.Chtimes(path, old.modTime, old.modTime); err != nil {
-				LogW("Incremental", "could not restore mtime", path, err.Error())
-			}
 		}
 		return nil
 	})
@@ -448,16 +439,32 @@ func compileKotlin(incremental bool) bool {
 		return false
 	}
 
+	// kotlinc has no per-file incremental mode at the command line: whenever the
+	// stage runs, the whole module goes in. Listing the files instead of handing
+	// over the directory with the changed ones on top keeps what is compiled and
+	// what is recorded the same set, and the .java sources stay in the request
+	// because kotlin resolves against them without compiling them.
+	compiling := kotlins
+	if incremental {
+		compiling, _ = getFiles("src", "kt", false)
+	}
+	javas, _ := getFiles("src", "java", false)
+	if incremental {
+		LogD("Incremental", "kotlinc takes the whole module:", len(compiling), "kotlin files,",
+			len(javas), "java sources for resolution")
+	}
+	sources := append(append([]string{}, compiling...), javas...)
+
 	// the classpath always needs every jar, not only the ones that changed
 	jars := allJars()
 	for _, lack := range kotlinShortcomings(kotlincPath, jars) {
-		LogW("kotlinc", lack, "needed to compile", len(kotlins), "kotlin files")
+		LogW("kotlinc", lack, "needed to compile", len(compiling), "kotlin files")
 	}
 
 	LogI("build", "compiling kotlin files")
 
-	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", classpath(append([]string{androidJar}, jars...)), "src"}
-	args = append(args, kotlins...)
+	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", classpath(append([]string{androidJar}, jars...))}
+	args = append(args, sources...)
 	cmd := exec.Command(kotlincPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -467,7 +474,7 @@ func compileKotlin(incremental bool) bool {
 		LogW("kotlinc", string(out))
 	}
 	if incremental {
-		updateRecords(kotlins)
+		updateRecords(compiling)
 	}
 	return true
 }

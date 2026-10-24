@@ -46,74 +46,72 @@ func TestManifestMinAPI(t *testing.T) {
 	}
 }
 
-// writeGenJava lays an R.java down with an old mtime, the way a previous build
-// would have left it in the incremental records.
-func writeGenJava(t *testing.T, path string, content string) time.Time {
+// writeGenJava lays one of the files aapt produces down and records its content,
+// which is the state a previous build leaves behind: compiled, nothing to do.
+func writeGenJava(t *testing.T, path string, content string) {
 	t.Helper()
 
-	old := time.Now().Add(-48 * time.Hour).Round(time.Second)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatal(err)
-	}
-	return old
+	loadTable()
+	DataTable.Digests[path] = sha1Text(content)
 }
 
-func TestSettleGenJavaKeepsUnchangedFileAsUnchanged(t *testing.T) {
+func TestGenJavaChangedKeepsUnchangedContentAsUnchanged(t *testing.T) {
 	setupProject(t)
 
 	const body = "package com.myapp;\npublic final class R { int a=1; }\n"
 	path := filepath.Join("src", "com", "myapp", "R.java")
-	old := writeGenJava(t, path, body)
-	// the record a previous build left behind: without it every file looks new
-	seedTable(t, "apk", map[string]int64{path: old.UnixNano()})
+	writeGenJava(t, path, body)
 
+	// aapt2 link rewrites every R.java on every run, even with the same ids: only
+	// the content can tell that apart from an edit
 	before := snapshotGenJava()
-	// aapt2 link rewrites every R.java on every run, even with the same ids
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !hasChanged(path) {
-		t.Fatal("rewriting the file must look like a change before settling")
-	}
-
-	if settleGenJava(before) {
+	if genJavaChanged(before) {
 		t.Fatal("identical content must not report a change")
 	}
 	if hasChanged(path) {
-		t.Fatal("unchanged content must keep the mtime it was snapshotted with")
+		t.Fatal("a rewrite with the same bytes is not a file javac has to see again")
 	}
-	if got := modTimeOf(t, path); got != old.UnixNano() {
-		t.Fatalf("mtime restored to %d, want %d", got, old.UnixNano())
+
+	// and the same bytes under a future timestamp stay compiled: this is what an
+	// editor that rewrites a file, or a restore that keeps mtimes, does to sources
+	later := time.Now().Add(2 * time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if hasChanged(path) {
+		t.Fatal("a timestamp alone must not send the file through javac")
 	}
 }
 
-func TestSettleGenJavaReportsChangedContent(t *testing.T) {
+func TestGenJavaChangedReportsChangedContent(t *testing.T) {
 	setupProject(t)
 
 	path := filepath.Join("src", "com", "myapp", "R.java")
-	old := writeGenJava(t, path, "package com.myapp;\npublic final class R { int a=1; }\n")
-	seedTable(t, "apk", map[string]int64{path: old.UnixNano()})
+	writeGenJava(t, path, "package com.myapp;\npublic final class R { int a=1; }\n")
 
 	before := snapshotGenJava()
 	if err := os.WriteFile(path, []byte("package com.myapp;\npublic final class R { int a=2; }\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	if !settleGenJava(before) {
+	if !genJavaChanged(before) {
 		t.Fatal("different content must report a change")
 	}
 	if !hasChanged(path) {
-		t.Fatal("changed content must keep its new mtime")
+		t.Fatal("new bytes under an old record must go through javac again")
 	}
 }
 
-func TestSettleGenJavaReportsNewAndVanishedFiles(t *testing.T) {
+func TestGenJavaChangedReportsNewAndVanishedFiles(t *testing.T) {
 	setupProject(t)
 
 	kept := filepath.Join("src", "com", "myapp", "R.java")
@@ -130,7 +128,7 @@ func TestSettleGenJavaReportsNewAndVanishedFiles(t *testing.T) {
 	if err := os.WriteFile(fresh, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !settleGenJava(before) {
+	if !genJavaChanged(before) {
 		t.Fatal("a new R.java must report a change")
 	}
 
@@ -139,7 +137,7 @@ func TestSettleGenJavaReportsNewAndVanishedFiles(t *testing.T) {
 	if err := os.Remove(fresh); err != nil {
 		t.Fatal(err)
 	}
-	if !settleGenJava(before) {
+	if !genJavaChanged(before) {
 		t.Fatal("a vanished R.java must report a change")
 	}
 }
@@ -148,26 +146,22 @@ func TestSettleGenJavaReportsNewAndVanishedFiles(t *testing.T) {
 // the <permission> elements of the merged manifest). aapt2 rewrites it on every
 // link, so leaving it out of the comparison made a resource edit recompile every
 // source of the project: measured as 59s instead of 10s on a 60 jar project.
-func TestSettleGenJavaCoversManifestJava(t *testing.T) {
+func TestGenJavaChangedCoversManifestJava(t *testing.T) {
 	setupProject(t)
 
 	const body = "package com.myapp;\npublic final class Manifest { public static final class permission { public static final String P=\"x\"; } }\n"
 	path := filepath.Join("src", "com", "myapp", "Manifest.java")
-	old := writeGenJava(t, path, body)
-	seedTable(t, "apk", map[string]int64{path: old.UnixNano()})
+	writeGenJava(t, path, body)
 
 	before := snapshotGenJava()
 	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !hasChanged(path) {
-		t.Fatal("rewriting the file must look like a change before settling")
-	}
-	if settleGenJava(before) {
+	if genJavaChanged(before) {
 		t.Fatal("an unchanged Manifest.java must not invalidate the sources")
 	}
 	if hasChanged(path) {
-		t.Fatal("an unchanged Manifest.java must keep its mtime")
+		t.Fatal("an unchanged Manifest.java is not a file the compiler has to see")
 	}
 
 	// and the same file with a real change has to report it
@@ -175,7 +169,7 @@ func TestSettleGenJavaCoversManifestJava(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Replace(body, `P="x"`, `P="y"`, 1)), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !settleGenJava(before) {
+	if !genJavaChanged(before) {
 		t.Fatal("a Manifest.java whose permission changed must invalidate the sources")
 	}
 }

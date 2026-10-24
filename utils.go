@@ -51,8 +51,14 @@ func prompt(text string, defaultValue string) string {
 }
 
 type Data struct {
-	Type       string           `json:"type"`
-	Timestamps map[string]int64 `json:"timestamps"`
+	Type string `json:"type"`
+	// Digests is the content every tracked file had when it was last compiled:
+	// sources, resources and the java aapt generates. A timestamp cannot answer
+	// whether the bytes changed, in either direction: an editor or a tool that
+	// rewrites a file with the same content costs a whole recompilation by mtime,
+	// and a `cp -p` or a tar restore that puts new bytes under an old timestamp
+	// compiles nothing at all, leaving a stale class inside the apk.
+	Digests map[string]string `json:"digests"`
 	// DexInputs is what the last merge got from jar/, as a digest of the jar
 	// contents. Timestamps cannot answer that question: a dependency rewritten
 	// with the same bytes is not a change, and one replaced with older timestamps
@@ -111,83 +117,74 @@ func saveTable() {
 }
 
 func setCompilationType(Type string) bool {
-	if DataTable.Timestamps == nil {
-		b, err := os.ReadFile(DataFile)
-		if err != nil {
-			DataTable.Type = Type
-			DataTable.Timestamps = map[string]int64{}
-			saveTable()
-			return false
-		} else if err := json.Unmarshal(b, &DataTable); err != nil {
-			LogF("Incremental", "Unmarshal", err.Error())
-		}
-		if DataTable.Timestamps == nil {
-			DataTable.Timestamps = map[string]int64{}
-		}
+	loadTable()
+	if DataTable.Type == Type {
+		return false
 	}
-	if DataTable.Type != Type {
-		DataTable.Type = Type
-		saveTable()
-		return true
-	}
-	return false
+
+	// An empty type is a state that has recorded nothing yet: adopting the type
+	// this build uses is not a change of shape, and the first run treats every
+	// stage as missing anyway.
+	changed := DataTable.Type != ""
+	DataTable.Type = Type
+	saveTable()
+	return changed
 }
 
-func getLastRecord(filePath string) int64 {
-	if DataTable.Timestamps == nil {
-		b, err := os.ReadFile(DataFile)
-		if err != nil {
-			DataTable.Timestamps = map[string]int64{}
-			return 0
-		}
+// loadTable reads the incremental state the first time a stage asks for it. A
+// state this build cannot read is not a reason to refuse building: the records
+// start empty, every stage sees its input as new, and the next successful round
+// writes a state that is whole again.
+func loadTable() {
+	if DataTable.Digests != nil {
+		return
+	}
+	if b, err := os.ReadFile(DataFile); err == nil {
 		if err := json.Unmarshal(b, &DataTable); err != nil {
-			LogF("Incremental", "Unmarshal", err.Error())
-		}
-		if DataTable.Timestamps == nil {
-			DataTable.Timestamps = map[string]int64{}
+			LogW("Incremental", "the state file is not readable, deciding everything by its bytes again", err.Error())
+			DataTable = Data{}
 		}
 	}
-	return DataTable.Timestamps[filePath]
-}
-
-func modTime(filePath string) (int64, bool) {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return 0, false
+	if DataTable.Digests == nil {
+		DataTable.Digests = map[string]string{}
 	}
-
-	return info.ModTime().UnixNano(), true
 }
 
 // hasChanged reports a missing file as unchanged: deletions are handled by
 // pruneDeleted, which also removes the artifacts the file produced.
 func hasChanged(filePath string) bool {
-	actualRecord, ok := modTime(filePath)
-	if !ok {
+	digest, err := fileSHA1(filePath)
+	if err != nil {
 		return false
 	}
-	return actualRecord != getLastRecord(filePath)
+	return digest != recordedDigest(filePath)
+}
+
+// recordedDigest is the content the last compile of this file saw.
+func recordedDigest(filePath string) string {
+	loadTable()
+	return DataTable.Digests[filePath]
 }
 
 func updateRecords(files []string) {
-	if DataTable.Timestamps == nil {
-		DataTable.Timestamps = map[string]int64{}
-	}
+	loadTable()
 	for _, file := range files {
-		modTime, ok := modTime(file)
-		if !ok {
+		digest, err := fileSHA1(file)
+		if err != nil {
 			continue
 		}
-		DataTable.Timestamps[file] = modTime
+		DataTable.Digests[file] = digest
 	}
 }
 
+// markAsChanged forgets what a file looked like, which is how the build says it
+// has to go through the compiler again: with no record to compare against, any
+// content is a change. A timestamp set to the past would not have done it, and
+// the same content rewritten would have looked unchanged.
 func markAsChanged(files []string) {
-	if DataTable.Timestamps == nil {
-		DataTable.Timestamps = map[string]int64{}
-	}
+	loadTable()
 	for _, file := range files {
-		DataTable.Timestamps[file] = 0
+		delete(DataTable.Digests, file)
 	}
 }
 
@@ -205,11 +202,12 @@ func rootDir(path string) string {
 // above API 21 the dependencies go to their own dexes, and taking one away is
 // the bundle's problem, not a reason to pass the sources through d8 again.
 func pruneDeleted(depsMerged bool) (resStale bool, classStale bool) {
-	for file := range DataTable.Timestamps {
+	loadTable()
+	for file := range DataTable.Digests {
 		if exists(file) {
 			continue
 		}
-		delete(DataTable.Timestamps, file)
+		delete(DataTable.Digests, file)
 
 		switch rootDir(file) {
 		case "res":

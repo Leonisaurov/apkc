@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // setupProject creates an isolated project dir, chdirs into it and resets the
@@ -34,10 +35,12 @@ func writeFile(t *testing.T, path string) {
 	}
 }
 
-func seedTable(t *testing.T, buildType string, timestamps map[string]int64) {
+// seedTable lays the state open the way the build before this one left it: the
+// type it compiled, and for every tracked file the content it compiled from.
+func seedTable(t *testing.T, buildType string, records map[string]string) {
 	t.Helper()
 
-	DataTable = Data{Type: buildType, Timestamps: timestamps}
+	DataTable = Data{Type: buildType, Digests: records}
 	b, err := json.Marshal(DataTable)
 	if err != nil {
 		t.Fatal(err)
@@ -47,14 +50,18 @@ func seedTable(t *testing.T, buildType string, timestamps map[string]int64) {
 	}
 }
 
-func modTimeOf(t *testing.T, path string) int64 {
+// recorded is the entry a file needs in the state to count as already compiled:
+// its own bytes. A test that wants "the content moved" writes the file again
+// without touching this, and a test that wants "the timestamp moved, the content
+// did not" records this and then sets an older mtime.
+func recorded(t *testing.T, path string) string {
 	t.Helper()
 
-	ns, ok := modTime(path)
-	if !ok {
-		t.Fatalf("modTime(%s) reported missing file", path)
+	digest, err := fileSHA1(path)
+	if err != nil {
+		t.Fatalf("fileSHA1(%s): %v", path, err)
 	}
-	return ns
+	return digest
 }
 
 func equalStrings(a, b []string) bool {
@@ -85,7 +92,7 @@ func TestSetCompilationTypeFirstRun(t *testing.T) {
 
 func TestSetCompilationTypeChange(t *testing.T) {
 	setupProject(t)
-	seedTable(t, "apk", map[string]int64{})
+	seedTable(t, "apk", map[string]string{})
 
 	if !setCompilationType("aab") {
 		t.Fatal("apk -> aab must report a type change")
@@ -102,7 +109,7 @@ func TestGetFilesSplitsChanged(t *testing.T) {
 
 	main := filepath.Join("res", "layout", "main.xml")
 	styles := filepath.Join("res", "values", "styles.xml")
-	seedTable(t, "apk", map[string]int64{main: 1, styles: modTimeOf(t, styles)})
+	seedTable(t, "apk", map[string]string{main: "no record of this content", styles: recorded(t, styles)})
 
 	changed, unchanged := getFiles("res", "", true)
 	if !equalStrings(changed, []string{main}) {
@@ -127,7 +134,7 @@ func TestGetFilesJarExtensionFullSet(t *testing.T) {
 	setupProject(t)
 	jar := filepath.Join("jar", "dep.jar")
 	writeFile(t, jar)
-	seedTable(t, "apk", map[string]int64{jar: modTimeOf(t, jar)})
+	seedTable(t, "apk", map[string]string{jar: recorded(t, jar)})
 
 	if changed, _ := getFiles("jar", "jar", true); len(changed) != 0 {
 		t.Fatalf("unchanged jar must not be reported as changed: %v", changed)
@@ -140,11 +147,61 @@ func TestGetFilesJarExtensionFullSet(t *testing.T) {
 
 func TestHasChangedMissingFile(t *testing.T) {
 	setupProject(t)
-	seedTable(t, "apk", map[string]int64{})
+	seedTable(t, "apk", map[string]string{})
 
 	if hasChanged(filepath.Join("res", "layout", "missing.xml")) {
 		t.Fatal("a file without record and without content is not a change")
 	}
+}
+
+// TestHasChangedFollowsBytesNotTimestamps is the reason the records are digests.
+// A `cp -p`, a tar restore or a sync puts new bytes under the timestamp the state
+// remembers, and by mtime that is not a change: the project keeps compiling
+// against a class nobody rebuilt, and the apk ships it.
+func TestHasChangedFollowsBytesNotTimestamps(t *testing.T) {
+	setupProject(t)
+	src := filepath.Join("src", "demo", "Foo.java")
+	writeFile(t, src)
+	seedTable(t, "apk", map[string]string{src: recorded(t, src)})
+
+	if hasChanged(src) {
+		t.Fatal("a file nobody touched must not be compiled again")
+	}
+
+	stamp := statModTime(t, src)
+	if err := os.WriteFile(src, []byte("class Foo { int different; }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if !hasChanged(src) {
+		t.Fatal("new bytes under the timestamp the state remembers must be compiled again")
+	}
+
+	// and the other direction: the same bytes under a timestamp from the future
+	// are still the same bytes, and must not cost a compilation
+	if err := os.WriteFile(src, []byte("class Foo { int different; }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	future := stamp.Add(48 * time.Hour)
+	if err := os.Chtimes(src, future, future); err != nil {
+		t.Fatal(err)
+	}
+	updateRecords([]string{src})
+	if hasChanged(src) {
+		t.Fatal("a rewrite of recorded content must stay unchanged")
+	}
+}
+
+func statModTime(t *testing.T, path string) time.Time {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.ModTime()
 }
 
 func TestUpdateRecordsIgnoresMissingFiles(t *testing.T) {
@@ -153,10 +210,10 @@ func TestUpdateRecordsIgnoresMissingFiles(t *testing.T) {
 
 	updateRecords([]string{filepath.Join("src", "demo", "Foo.java"), filepath.Join("src", "demo", "Gone.java")})
 
-	if _, ok := DataTable.Timestamps[filepath.Join("src", "demo", "Foo.java")]; !ok {
+	if _, ok := DataTable.Digests[filepath.Join("src", "demo", "Foo.java")]; !ok {
 		t.Fatal("existing file must be recorded")
 	}
-	if _, ok := DataTable.Timestamps[filepath.Join("src", "demo", "Gone.java")]; ok {
+	if _, ok := DataTable.Digests[filepath.Join("src", "demo", "Gone.java")]; ok {
 		t.Fatal("missing file must not be recorded")
 	}
 }
@@ -172,9 +229,9 @@ func TestPruneDeletedPurgesFlatsAndForcesRecompile(t *testing.T) {
 	flatDir := filepath.Join("build", "flats")
 	writeFile(t, filepath.Join(flatDir, "layout_main.xml.flat"))
 	writeFile(t, filepath.Join(flatDir, "values_styles.arsc.flat"))
-	seedTable(t, "apk", map[string]int64{
-		main:   modTimeOf(t, main),
-		styles: modTimeOf(t, styles),
+	seedTable(t, "apk", map[string]string{
+		main:   recorded(t, main),
+		styles: recorded(t, styles),
 	})
 
 	if err := os.Remove(main); err != nil {
@@ -196,10 +253,10 @@ func TestPruneDeletedPurgesFlatsAndForcesRecompile(t *testing.T) {
 	if len(flats) != 0 {
 		t.Errorf("every flat must be purged so no deleted resource survives, got %v", flats)
 	}
-	if got := DataTable.Timestamps[styles]; got != 0 {
-		t.Errorf("living resource must be marked for recompilation, record = %d", got)
+	if _, ok := DataTable.Digests[styles]; ok {
+		t.Error("a living resource must be marked for recompilation by dropping its record")
 	}
-	if _, ok := DataTable.Timestamps[main]; ok {
+	if _, ok := DataTable.Digests[main]; ok {
 		t.Error("record of a deleted file must be dropped")
 	}
 }
@@ -219,10 +276,10 @@ func TestPruneDeletedRemovesInnerClasses(t *testing.T) {
 	writeFile(t, filepath.Join(classDir, "Bar.class"))
 	// same class name in another package must survive
 	writeFile(t, filepath.Join("build", "classes", "other", "Foo.class"))
-	seedTable(t, "apk", map[string]int64{
-		foo:     modTimeOf(t, foo),
-		bar:     modTimeOf(t, bar),
-		homonym: modTimeOf(t, homonym),
+	seedTable(t, "apk", map[string]string{
+		foo:     recorded(t, foo),
+		bar:     recorded(t, bar),
+		homonym: recorded(t, homonym),
 	})
 
 	if err := os.Remove(foo); err != nil {
@@ -257,7 +314,7 @@ func TestPruneDeletedRemovesInnerClasses(t *testing.T) {
 	if !equalStrings(left, want) {
 		t.Errorf("classes left in build/classes = %v, want %v", left, want)
 	}
-	if _, ok := DataTable.Timestamps[foo]; ok {
+	if _, ok := DataTable.Digests[foo]; ok {
 		t.Error("record of the deleted source must be dropped")
 	}
 }
@@ -280,7 +337,7 @@ func TestPruneDeletedJarFollowsTheDexLayout(t *testing.T) {
 			setupProject(t)
 			jarFile := filepath.Join("jar", "dep-1.0.jar")
 			writeFile(t, jarFile)
-			seedTable(t, "apk", map[string]int64{jarFile: modTimeOf(t, jarFile)})
+			seedTable(t, "apk", map[string]string{jarFile: recorded(t, jarFile)})
 
 			if err := os.Remove(jarFile); err != nil {
 				t.Fatal(err)
@@ -293,7 +350,7 @@ func TestPruneDeletedJarFollowsTheDexLayout(t *testing.T) {
 			if classStale != tc.wantClass {
 				t.Errorf("classStale = %v, want %v", classStale, tc.wantClass)
 			}
-			if _, ok := DataTable.Timestamps[jarFile]; ok {
+			if _, ok := DataTable.Digests[jarFile]; ok {
 				t.Error("record of the deleted jar must be dropped")
 			}
 		})
