@@ -66,6 +66,12 @@ func _build(o buildOpts) {
 	// API 1 and rewrites every lambda of every dependency
 	api := manifestMinAPI()
 
+	// the manifest also dictates how lib/ travels inside the package, and that is
+	// a fact about the bytes of the apk, not about what is stale: a plain build
+	// needs it just as much as an incremental one
+	storedLibs, libsDeclared := manifestNativeLibsStored()
+	libs := nativeLibs{stored: storedLibs, declared: libsDeclared}
+
 	var settedType, resStale, classStale, manifestStale, apiChanged bool
 	firstRun := false
 	if o.incremental {
@@ -187,14 +193,14 @@ func _build(o buildOpts) {
 	var auxDigests map[string]string
 	roster := ""
 	if o.incremental {
-		roster, auxDigests = auxRoster()
+		roster, auxDigests = auxRoster(libs.stored)
 		auxStale = roster != DataTable.AuxInputs
 	}
 
 	needBundle := !o.incremental || firstRun || settedType || compRes || compSource || resStale || classStale ||
 		manifestStale || depChanged || auxStale || resMissing || dexMissing || !exists("build/bundle.zip")
 	if needBundle {
-		buildBundle(o.useAAB, depDexes, auxDigests)
+		buildBundle(o.useAAB, depDexes, auxDigests, libs)
 		if o.incremental {
 			DataTable.AuxInputs = roster
 			// the bundle is what consumes a dependency set: recording the
@@ -226,7 +232,7 @@ func _build(o buildOpts) {
 		}
 		apkOk := exists(filepath.Join("build", "app.apk"))
 		if !o.incremental || !apkOk || bundleSha != DataTable.BundleSha1 {
-			alignAPK()
+			alignAPK(libs.stored)
 			signAPK(o.keyStore, o.storePass, o.keyAlias)
 			if o.incremental {
 				DataTable.BundleSha1 = bundleSha
@@ -585,7 +591,12 @@ func jarsFingerprint(api int, digests []string) string {
 // bytes and not timestamps is what keeps a tool re-copying the same .so from
 // costing a whole bundle. The per file digests come along because the bundle wants
 // them to decide what it can copy raw, and those two trees are already read here.
-func auxRoster() (string, map[string]string) {
+//
+// The method lib/ is packed with is part of the roster too: flipping
+// android:extractNativeLibs changes the package with not one byte of any .so
+// moved, and a roster that stayed the same would let the bundle, and with it the
+// apk, go unwritten.
+func auxRoster(libStored bool) (string, map[string]string) {
 	lines := []string{}
 	digests := map[string]string{}
 	for _, dir := range []string{"lib", "assets"} {
@@ -598,7 +609,11 @@ func auxRoster() (string, map[string]string) {
 				digest = "unreadable:" + file
 			}
 			digests[file] = digest
-			lines = append(lines, file+"\n"+digest)
+			line := file + "\n" + digest
+			if dir == "lib" {
+				line += "\n" + zipMethod(libStored)
+			}
+			lines = append(lines, line)
 		}
 	}
 	return sha1Text(strings.Join(lines, "\n")), digests
@@ -895,6 +910,26 @@ type bundleEntry struct {
 	digest   string
 }
 
+// zipMethod names how an entry is carried inside the package. The record of the
+// last bundle has to know it: an entry copied over from that package comes with
+// the method it was written with, so a change of method must not reuse it.
+func zipMethod(compress bool) string {
+	if compress {
+		return "deflate"
+	}
+	return "store"
+}
+
+// contentKey is what the record of a bundled entry holds: the bytes it was
+// written from and the method it was written with. Both, because a package that
+// flips android:extractNativeLibs has to write that entry again even though the
+// file did not change: copying the old bytes would keep the previous method, and
+// a deflated .so behind extractNativeLibs=false is a package the runtime cannot
+// map, which is worse than a rebuild.
+func (e bundleEntry) contentKey() string {
+	return e.digest + "|" + zipMethod(e.compress)
+}
+
 // reusePlan answers, for each planned entry in order, whether the previous package can hand
 // it over as it is. That happens only when the old package holds the name, the source still
 // hashes to what the last bundle wrote from it, and an earlier entry has not already taken
@@ -907,13 +942,22 @@ func reusePlan(plan []bundleEntry, old map[string]bool, recorded map[string]stri
 	entries = make(map[string]string, len(plan))
 	taken := map[string]bool{}
 	for i, entry := range plan {
-		entries[entry.name] = entry.digest
-		if old[entry.name] && !taken[entry.name] && recorded[entry.name] == entry.digest {
+		key := entry.contentKey()
+		entries[entry.name] = key
+		if old[entry.name] && !taken[entry.name] && recorded[entry.name] == key {
 			reuse[i] = true
 			taken[entry.name] = true
 		}
 	}
 	return reuse, entries
+}
+
+// nativeLibs is what the manifest dictates about the .so of lib/ inside the
+// package: stored and page aligned when it promises the runtime can map them
+// from the apk, deflated when it expects the package manager to unpack them.
+type nativeLibs struct {
+	stored   bool
+	declared bool
 }
 
 // buildBundle writes build/bundle.zip. The entries are planned first and then written
@@ -923,7 +967,7 @@ func reusePlan(plan []bundleEntry, old map[string]bool, recorded map[string]stri
 // recompressing a hundred and thirty six megabytes of assets that did not change.
 // The new package goes through a temporary file and a rename, because the previous one
 // is still open as the source of those raw copies while this one is being written.
-func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string) {
+func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string, libs nativeLibs) {
 	defer timeIt("bundle zip")()
 
 	// the digest of a file, taken from the roster lib/ and assets/ already hashed
@@ -995,9 +1039,17 @@ func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string) {
 	files, _ = getFiles("lib", "", false)
 	if len(files) > 0 {
 		LogI("build", "bundling native libs")
+		if !libs.declared {
+			// the pairing is what breaks installs, and it is decided by an
+			// attribute most project authors never wrote down
+			LogD("build", "no android:extractNativeLibs in the manifest:", len(files),
+				"libs go in deflated, so the package manager unpacks them at install")
+		} else if libs.stored {
+			LogD("build", "extractNativeLibs=false:", len(files), "libs go in stored, and page aligned")
+		}
 	}
 	for _, f := range files {
-		add(f, f, true)
+		add(f, f, !libs.stored)
 	}
 
 	// opened before anything is written: the old package is the source of the raw

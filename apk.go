@@ -5,12 +5,21 @@ import (
 	"path/filepath"
 )
 
-// alignAPK does zipalign
-func alignAPK() {
+// alignAPK does zipalign. pageAlign is the other half of
+// android:extractNativeLibs="false": -p puts every uncompressed .so on a page
+// boundary, which is what lets the runtime map it out of the apk instead of
+// unpacking it at install.
+func alignAPK(pageAlign bool) {
 	defer timeIt("zipalign")()
 	LogI("build", "running zipalign")
 
-	cmd := exec.Command(zipAlignPath, "-f", "4", filepath.Join("build", "bundle.zip"), filepath.Join("build", "app.apk"))
+	args := []string{"-f"}
+	if pageAlign {
+		args = append(args, "-p")
+	}
+	args = append(args, "4", filepath.Join("build", "bundle.zip"), filepath.Join("build", "app.apk"))
+
+	cmd := exec.Command(zipAlignPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		LogF("build", string(out))

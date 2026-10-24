@@ -59,9 +59,40 @@ func manifestChanged() bool {
 	return true
 }
 
+// manifestNativeLibsStored reports how lib/ has to go into the package, which is
+// the manifest's decision and not apkc's: android:extractNativeLibs="false"
+// promises the runtime that it can map a .so straight out of the apk, and that
+// only holds when the entry is stored (not deflated) and page aligned. Anything
+// else, including the attribute being absent, keeps the libraries deflated and
+// lets the package manager unpack them at install.
+func manifestNativeLibsStored() (stored bool, declared bool) {
+	mb, err := os.ReadFile("AndroidManifest.xml")
+	if err != nil {
+		return false, false
+	}
+
+	manifest := Manifest{}
+	if err := xml.Unmarshal(mb, &manifest); err != nil {
+		return false, false
+	}
+
+	switch strings.TrimSpace(manifest.Application.ExtractNativeLibs) {
+	case "":
+		return false, false
+	case "false":
+		return true, true
+	default:
+		return false, true
+	}
+}
+
 type Application struct {
 	XMLName    xml.Name   `xml:"application"`
 	Activities []Activity `xml:"activity"`
+	// ExtractNativeLibs is the attribute the pairing above is read from. It is
+	// kept as a string because the manifest also carries "@bool/reference" here,
+	// and only the literal "false" asks for the stored layout.
+	ExtractNativeLibs string `xml:"extractNativeLibs,attr"`
 }
 
 func (a Application) MainActivity() string {

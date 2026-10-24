@@ -276,7 +276,7 @@ func TestManifestChangedFollowsContent(t *testing.T) {
 // rosterText is the roster alone: the tests of the incremental decision do not care
 // about the per file digests the bundle reuses.
 func rosterText() string {
-	roster, _ := auxRoster()
+	roster, _ := auxRoster(false)
 	return roster
 }
 
@@ -291,7 +291,7 @@ func TestAuxRosterDigestsNameTheFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, digests := auxRoster()
+	_, digests := auxRoster(false)
 	want, err := fileSHA1(asset)
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +308,7 @@ func TestAuxRosterDigestsNameTheFiles(t *testing.T) {
 	if err := os.WriteFile(asset, []byte("two\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, after := auxRoster(); after[asset] == want {
+	if _, after := auxRoster(false); after[asset] == want {
 		t.Fatal("a rewritten asset must report a new digest")
 	}
 }
@@ -366,5 +366,78 @@ func TestAuxRosterFollowsNamesAndBytes(t *testing.T) {
 	}
 	if rosterText() != two {
 		t.Fatal("the roster must come back to the state without the asset")
+	}
+}
+
+// TestAuxRosterFollowsThePackingOfNativeLibs covers the case a manifest edit
+// alone produces: the .so bytes are untouched, only the method they travel with
+// changes, and a roster that misses it leaves the old deflated entry in the apk.
+func TestAuxRosterFollowsThePackingOfNativeLibs(t *testing.T) {
+	setupProject(t)
+
+	if err := os.MkdirAll(filepath.Join("lib", "arm64-v8a"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	lib := filepath.Join("lib", "arm64-v8a", "libfoo.so")
+	if err := os.WriteFile(lib, []byte("same bytes\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	deflated := rosterText()
+	stored, _ := auxRoster(true)
+	if stored == deflated {
+		t.Fatal("extractNativeLibs=false packs the same file another way, and the roster has to say so")
+	}
+	if again, _ := auxRoster(true); again != stored {
+		t.Fatal("the same decision must answer the same roster")
+	}
+
+	// assets are not native libraries: the attribute does not reach them
+	if err := os.MkdirAll("assets", 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("assets", "dato.txt"), []byte("x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	withAssetDeflated := rosterText()
+	withAssetStored, _ := auxRoster(true)
+	if withAssetStored == withAssetDeflated {
+		t.Fatal("the asset must not hide the difference lib/ makes")
+	}
+}
+
+func TestManifestNativeLibsStored(t *testing.T) {
+	setupProject(t)
+
+	// "false" is the promise that the runtime maps the .so out of the package,
+	// which only holds when the entry is stored and page aligned
+	writeManifest(t, `<manifest package="com.myapp"><application android:extractNativeLibs="false"/></manifest>`)
+	if stored, declared := manifestNativeLibsStored(); stored != true || declared != true {
+		t.Fatalf("extractNativeLibs=false read as stored=%v declared=%v", stored, declared)
+	}
+
+	writeManifest(t, `<manifest package="com.myapp"><application android:extractNativeLibs="true"/></manifest>`)
+	if stored, declared := manifestNativeLibsStored(); stored != false || declared != true {
+		t.Fatalf("extractNativeLibs=true read as stored=%v declared=%v", stored, declared)
+	}
+
+	// no attribute is not a declaration: apkc deflates, which is what every
+	// Android version accepts, and says it unpacked the choice rather than read it
+	writeManifest(t, `<manifest package="com.myapp"><application/></manifest>`)
+	if stored, declared := manifestNativeLibsStored(); stored != false || declared != false {
+		t.Fatalf("no attribute read as stored=%v declared=%v", stored, declared)
+	}
+
+	// a reference is not a literal the build can act on
+	writeManifest(t, `<manifest package="com.myapp"><application android:extractNativeLibs="@bool/unpacked"/></manifest>`)
+	if stored, _ := manifestNativeLibsStored(); stored {
+		t.Fatal("a reference must not be read as the stored layout")
+	}
+
+	if err := os.Remove("AndroidManifest.xml"); err != nil {
+		t.Fatal(err)
+	}
+	if stored, declared := manifestNativeLibsStored(); stored || declared {
+		t.Fatal("an absent manifest decides nothing about lib/")
 	}
 }
