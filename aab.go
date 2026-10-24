@@ -18,11 +18,11 @@ func buildAAB() {
 }
 
 // signAAB signs aab with jarsigner and provided debug keys
-func signAAB(keyStore, storePass, keyAlias, sigAlg *string) {
+func signAAB(keyStore, storePass, keyAlias, sigAlg string) {
 	LogI("build", "signing aab")
 
-	// cmd := exec.Command("jarsigner", "-verbose", "-sigalg", "SHA256withRSA", "pass:"+*storePass, "--ks", *keyStore, "--ks-key-alias", *keyAlias, filepath.Join("build", "app.apk"))
-	cmd := exec.Command("jarsigner", "-verbose", "-sigalg", *sigAlg, "-digestalg", "SHA1", "-storepass", *storePass, "-keystore", *keyStore, filepath.Join("build", "app.aab"), *keyAlias)
+	// cmd := exec.Command("jarsigner", "-verbose", "-sigalg", "SHA256withRSA", "pass:"+storePass, "--ks", keyStore, "--ks-key-alias", keyAlias, filepath.Join("build", "app.apk"))
+	cmd := exec.Command("jarsigner", "-verbose", "-sigalg", sigAlg, "-digestalg", "SHA1", "-storepass", storePass, "-keystore", keyStore, filepath.Join("build", "app.aab"), keyAlias)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		LogF("build", string(out))

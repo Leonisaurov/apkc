@@ -25,6 +25,8 @@ func main() {
 		build()
 	case "run":
 		run()
+	case "watch":
+		watch()
 	case "clean":
 		clean()
 	}
@@ -38,8 +40,9 @@ commands:
 
 doctor - check if Android sdk is accessible
 create - create a new project
-build  - build apk
-run    - build apk and run the available device
+build  - build apk (--inc for an incremental build, --aab for an app bundle)
+run    - build apk and run it on an available device (--inc, --rish)
+watch  - rebuild on every change (--inc, --run installs and follows the app)
 clean  - delete build/ dir
 `)
 }

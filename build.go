@@ -10,31 +10,126 @@ import (
 	"strings"
 )
 
-// build compiles all the source code and bundles into apk file with dependencies
+// buildOpts are the options every build stage needs, shared by build, run and watch.
+type buildOpts struct {
+	useAAB      bool
+	incremental bool
+	keyStore    string
+	storePass   string
+	keyAlias    string
+	sigAlg      string
+}
+
 func build() {
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
 
 	useAAB := buildCmd.Bool("aab", false, "build aab instead of apk")
+	incremental := buildCmd.Bool("inc", false, "Use the incremental build system.")
 	keyStore := buildCmd.String("keystore", keyStorePath, "path to keystore")
 	storePass := buildCmd.String("storepass", "android", "keystore password")
 	keyAlias := buildCmd.String("keyalias", "androiddebugkey", "key alias to use")
 	sigAlg := buildCmd.String("sigalg", "SHA256withRSA", "signature to use")
 
 	buildCmd.Parse(os.Args[2:])
+	_build(buildOpts{
+		useAAB:      *useAAB,
+		incremental: *incremental,
+		keyStore:    *keyStore,
+		storePass:   *storePass,
+		keyAlias:    *keyAlias,
+		sigAlg:      *sigAlg,
+	})
+}
 
+// build compiles all the source code and bundles into apk file with dependencies
+func _build(o buildOpts) {
 	prepare()
-	compileRes()
-	bundleRes(*useAAB)
-	compileKotlin()
-	compileJava()
-	bundleJava()
-	buildBundle(*useAAB)
-	if *useAAB {
-		buildAAB()
-		signAAB(keyStore, storePass, keyAlias, sigAlg)
+
+	var settedType, resStale, classStale bool
+	firstRun := false
+	if o.incremental {
+		// without any record the whole build dir must be treated as missing,
+		// even when every input looks unchanged
+		firstRun = !exists(DataFile)
+		if o.useAAB {
+			settedType = setCompilationType("aab")
+		} else {
+			settedType = setCompilationType("apk")
+		}
+		resStale, classStale = pruneDeleted()
+		if resStale || classStale {
+			saveTable()
+		}
+	}
+
+	if settedType {
+		LogI("Diagnostic", "Detected proyect type changed.", "Rebuilding.")
+	}
+
+	// the manifest holds the package name and the resource ids, so every
+	// resource and source has to be recompiled when it changes
+	if o.incremental && hasChanged("AndroidManifest.xml") {
+		ns, _ := modTime("AndroidManifest.xml")
+		DataTable.Timestamps["AndroidManifest.xml"] = ns
+		_, unchanged := getFiles("res", "", true)
+		markAsChanged(unchanged)
+		_, unchanged = getFiles("src", "kt", true)
+		markAsChanged(unchanged)
+		_, unchanged = getFiles("src", "java", true)
+		markAsChanged(unchanged)
+		saveTable()
+	}
+
+	// an intermediate deleted by hand must be produced again, no matter what
+	// the timestamps say about the inputs
+	linkedFile := filepath.Join("build", "resources.arsc")
+	if o.useAAB {
+		linkedFile = filepath.Join("build", "resources.pb")
+	}
+	resMissing := !exists(linkedFile)
+	dexMissing := !exists(filepath.Join("build", "classes.dex"))
+
+	compRes := compileRes(o.incremental)
+	if !o.incremental || firstRun || settedType || compRes || resStale || resMissing {
+		bundleRes(o.useAAB)
+	}
+
+	compSource := compileKotlin(o.incremental)
+	compSource = compileJava(o.incremental) || compSource
+	// a dependency is part of the classpath and of the dex input, so it makes
+	// the classes stale even when no source changed
+	jarChanged := false
+	if o.incremental {
+		for _, jar := range allJars() {
+			if hasChanged(jar) {
+				jarChanged = true
+				break
+			}
+		}
+	}
+	if !o.incremental || firstRun || settedType || compSource || classStale || jarChanged || dexMissing {
+		bundleJava()
+		if o.incremental {
+			updateRecords(allJars())
+		}
+	}
+
+	needBundle := !o.incremental || firstRun || settedType || compRes || compSource || resStale || classStale ||
+		jarChanged || resMissing || dexMissing || !exists("build/bundle.zip")
+	if needBundle {
+		buildBundle(o.useAAB)
+	}
+
+	if o.useAAB {
+		if needBundle || !exists("build/app.aab") {
+			buildAAB()
+			signAAB(o.keyStore, o.storePass, o.keyAlias, o.sigAlg)
+		}
 	} else {
-		alignAPK()
-		signAPK(keyStore, storePass, keyAlias)
+		if needBundle || !exists("build/app.apk") {
+			alignAPK()
+			signAPK(o.keyStore, o.storePass, o.keyAlias)
+		}
 	}
 }
 
@@ -68,8 +163,12 @@ func prepare() {
 }
 
 // compileRes compiles the xml files in res dir
-func compileRes() {
-	res := getFiles("res", "")
+func compileRes(incremental bool) bool {
+	res, _ := getFiles("res", "", incremental)
+	if len(res) < 1 {
+		return false
+	}
+
 	LogI("build", "compiling resources")
 	args := []string{"compile", "-o", filepath.Join("build", "flats")}
 	args = append(args, res...)
@@ -78,13 +177,20 @@ func compileRes() {
 	if err != nil {
 		LogF("build", string(out))
 	}
+	if incremental {
+		updateRecords(res)
+	}
+	return true
 }
 
 // bundleRes bundles all the flat files into apk and generates R.* id file for java
 func bundleRes(useAAB bool) {
-	LogI("build", "bundling resources")
+	flats, _ := getFiles("build/flats", ".flat", false)
+	if len(flats) < 1 {
+		return
+	}
 
-	flats := getFiles("build/flats", ".flat")
+	LogI("build", "bundling resources")
 	args := []string{"link", "-I", androidJar, "--manifest", "AndroidManifest.xml", "-o", "build", "--java", "src", "--output-to-dir"}
 	if useAAB {
 		args = append(args, "--proto-format")
@@ -97,15 +203,16 @@ func bundleRes(useAAB bool) {
 	}
 }
 
-func compileKotlin() {
-	kotlins := getFiles("src", "kt")
+func compileKotlin(incremental bool) bool {
+	kotlins, _ := getFiles("src", "kt", incremental)
 	if len(kotlins) < 1 {
-		return
+		return false
 	}
 
 	LogI("build", "compiling kotlin files")
 
-	jars := strings.Join(getFiles("jar", "jar"), ":")
+	// the classpath always needs every jar, not only the ones that changed
+	jars := strings.Join(allJars(), ":")
 
 	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", androidJar + ":" + jars, "src"}
 	args = append(args, kotlins...)
@@ -114,14 +221,28 @@ func compileKotlin() {
 	if err != nil {
 		LogF("build", string(out), args)
 	}
+	if incremental {
+		updateRecords(kotlins)
+	}
+	return true
+}
+
+// allJars returns every jar of the project. It is used for classpaths, where
+// an incremental subset would silently drop dependencies.
+func allJars() []string {
+	jars, _ := getFiles("jar", "jar", false)
+	return jars
 }
 
 // compileJava compiles java files in src dir and uses jar files in the jar dir as classpath
-func compileJava() {
+func compileJava(incremental bool) bool {
+	javas, _ := getFiles("src", "java", incremental)
+	if len(javas) < 1 {
+		return false
+	}
 	LogI("build", "compiling java files")
 
-	javas := getFiles("src", "java")
-	jars := strings.Join(getFiles("jar", "jar"), ":")
+	jars := strings.Join(allJars(), ":")
 
 	args := []string{"-d", filepath.Join("build", "classes"), "-classpath", androidJar + ":" + filepath.Join("build", "classes") + ":" + jars}
 	args = append(args, javas...)
@@ -130,15 +251,22 @@ func compileJava() {
 	if err != nil {
 		LogF("build", string(out), args)
 	}
+	if incremental {
+		updateRecords(javas)
+	}
+	return true
 }
 
 // bundleJava bundles compiled java class files and external jar files into apk
 func bundleJava() {
+	classes, _ := getFiles(filepath.Join("build", "classes"), ".class", false)
+	if len(classes) < 1 {
+		return
+	}
+
+	jars, _ := getFiles("jar", ".jar", false)
+
 	LogI("build", "bundling classes and jars")
-
-	classes := getFiles(filepath.Join("build", "classes"), ".class")
-	jars := getFiles("jar", ".jar")
-
 	args := []string{"--lib", androidJar, "--release", "--output", "build"}
 	args = append(args, classes...)
 	args = append(args, jars...)
@@ -193,7 +321,7 @@ func buildBundle(useAAB bool) {
 		addFileToZip(filepath.Join("build", "resources.arsc"), "resources.arsc", false)
 	}
 
-	files := getFiles(filepath.Join("build", "res"), "")
+	files, _ := getFiles(filepath.Join("build", "res"), "", false)
 	for _, f := range files {
 		r, err := filepath.Rel("build", f)
 		if err != nil {
@@ -202,7 +330,7 @@ func buildBundle(useAAB bool) {
 		addFileToZip(f, r, true)
 	}
 
-	files = getFiles("assets", "")
+	files, _ = getFiles("assets", "", false)
 	if len(files) > 0 {
 		LogI("build", "bundling assets")
 	}
@@ -210,7 +338,7 @@ func buildBundle(useAAB bool) {
 		addFileToZip(f, f, true)
 	}
 
-	files = getFiles("lib", "")
+	files, _ = getFiles("lib", "", false)
 	if len(files) > 0 {
 		LogI("build", "bundling native libs")
 	}

@@ -19,10 +19,10 @@ func alignAPK() {
 }
 
 // signAPK signs apk with apksigner and provided debug keys
-func signAPK(keyStore, storePass, keyAlias *string) {
+func signAPK(keyStore, storePass, keyAlias string) {
 	LogI("build", "signing app")
 
-	cmd := exec.Command(apksignerPath, "sign", "--ks-pass", "pass:"+*storePass, "--ks", *keyStore, "--ks-key-alias", *keyAlias, filepath.Join("build", "app.apk"))
+	cmd := exec.Command(apksignerPath, "sign", "--ks-pass", "pass:"+storePass, "--ks", keyStore, "--ks-key-alias", keyAlias, filepath.Join("build", "app.apk"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		LogF("build", string(out))
