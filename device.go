@@ -230,15 +230,6 @@ func run() {
 	cmd.Wait()
 }
 
-// stopCmd terminates a running device process, if there is one
-func stopCmd(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
-}
-
 // isGenerated reports whether a path is apkc output or tool state. Watching
 // those would make every build trigger the next one forever.
 func isGenerated(path string) bool {
@@ -252,10 +243,14 @@ func isGenerated(path string) bool {
 	return genJavaFile(filepath.Base(path))
 }
 
-func addRecursive(w *fsnotify.Watcher, root string) error {
-	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+// addRecursive watches every directory under root. A directory that cannot be
+// read or added is reported and left alone: one dangling symlink, or one tree
+// owned by another uid, must not take the whole watcher down.
+func addRecursive(w *fsnotify.Watcher, root string) {
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return err
+			LogW("watch", "not watching", path, err.Error())
+			return nil
 		}
 		if !d.IsDir() {
 			return nil
@@ -263,7 +258,10 @@ func addRecursive(w *fsnotify.Watcher, root string) error {
 		if path != root && isGenerated(d.Name()) {
 			return filepath.SkipDir
 		}
-		return w.Add(path)
+		if err := w.Add(path); err != nil {
+			LogW("watch", "not watching", path, err.Error())
+		}
+		return nil
 	})
 }
 
@@ -314,22 +312,39 @@ func watch() {
 	}
 	defer w.Close()
 
-	if err := addRecursive(w, "."); err != nil {
-		LogF("watch", "Add", err.Error())
-	}
+	addRecursive(w, ".")
 
 	debounce := 500 * time.Millisecond
 	var timer *time.Timer
 	var timeChan <-chan time.Time
 
-	var cmd *exec.Cmd
-	defer stopCmd(cmd)
+	// One round at a time. With --run the round is the app's own log stream and a
+	// new change replaces it at once; a plain build is left to finish, because
+	// killing it halfway throws away the work it already paid for. The events that
+	// arrive while a round runs are not replayed one by one from the queue: they
+	// set pending, and the next round covers all of them together.
+	var cur *exec.Cmd
+	var finished <-chan error
+	var pending bool
+	var roundNumber int
 
-	rebuild := func() {
-		stopCmd(cmd)
-		cmd = nil
+	startRound := func() {
+		if cur != nil {
+			if !*runEach {
+				pending = true
+				return
+			}
+			stopRound(cur)
+			cur, finished = nil, nil
+		}
+
+		roundNumber++
+		// one line per round: without it the log says that a file changed and
+		// then goes quiet, which looks exactly like a watcher that lost the event
+		LogI("watch", "round", roundNumber, "started")
 
 		roundCmd := exec.Command(self, append(round, args...)...)
+		roundCmd.SysProcAttr = roundProcAttr
 		roundCmd.Stdin = os.Stdin
 		roundCmd.Stdout = os.Stdout
 		roundCmd.Stderr = os.Stderr
@@ -337,17 +352,18 @@ func watch() {
 			LogE("watch", err.Error())
 			return
 		}
-		if *runEach {
-			// the app output keeps running until the next rebuild kills it
-			cmd = roundCmd
-			return
-		}
-		if err := roundCmd.Wait(); err != nil {
-			LogE("watch", "build failed, waiting for another change")
-		}
+
+		// buffered by one: a round replaced before this reads its exit still has
+		// somewhere to put it, so the waiter never blocks
+		done := make(chan error, 1)
+		go func() { done <- roundCmd.Wait() }()
+		cur, finished = roundCmd, done
 	}
 
-	rebuild()
+	// the closure matters: defer would otherwise capture cur while it is nil
+	defer func() { stopRound(cur) }()
+
+	startRound()
 
 	for {
 		select {
@@ -359,7 +375,7 @@ func watch() {
 			// a new subfolder has to be watched too
 			if ev.Op&fsnotify.Create != 0 {
 				if st, err := os.Stat(ev.Name); err == nil && st.IsDir() {
-					_ = addRecursive(w, ev.Name)
+					addRecursive(w, ev.Name)
 					continue
 				}
 			}
@@ -393,9 +409,21 @@ func watch() {
 			}
 			LogE("watch", err.Error())
 
+		case err := <-finished:
+			// finished is nil while no round runs, and a nil channel simply never
+			// fires, so this case is the only place a round is retired
+			cur, finished = nil, nil
+			if err != nil && !*runEach {
+				LogE("watch", "build failed, waiting for another change")
+			}
+			if pending {
+				pending = false
+				startRound()
+			}
+
 		case <-timeChan:
 			timer, timeChan = nil, nil
-			rebuild()
+			startRound()
 		}
 	}
 }

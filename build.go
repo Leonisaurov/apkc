@@ -202,6 +202,8 @@ func _build(o buildOpts) {
 			// when the bundle was skipped
 			DataTable.DexInputs = fingerprint
 		}
+	} else if o.incremental {
+		LogD("build", "nothing to put in the package this round")
 	}
 
 	// zipalign and apksigner are two java starts and a whole rewrite of the apk, so
@@ -229,6 +231,11 @@ func _build(o buildOpts) {
 			if o.incremental {
 				DataTable.BundleSha1 = bundleSha
 			}
+		} else if o.incremental {
+			// a touch of a resource recompiles and relinks it with the same bytes,
+			// and the round would otherwise end in silence: the apk on disk is the
+			// one this package was made from
+			LogD("build", "the package bytes did not change: the apk on disk stands")
 		}
 	}
 
