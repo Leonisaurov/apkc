@@ -3,7 +3,21 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 )
+
+// timeIt logs how long a build stage took when the returned function runs. Only
+// a stage that did real work is reported: an idle incremental cycle is under
+// 100 ms in every one of them and the lines would be noise over watch.
+func timeIt(stage string) func() {
+	start := time.Now()
+	return func() {
+		took := time.Since(start)
+		if took > 100*time.Millisecond {
+			LogD("timing", stage, took.Round(time.Millisecond))
+		}
+	}
+}
 
 func LogI(tag string, args ...interface{}) {
 	LogLevel("I", tag, args...)

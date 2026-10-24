@@ -180,7 +180,7 @@ func TestPruneDeletedPurgesFlatsAndForcesRecompile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resStale, classStale := pruneDeleted()
+	resStale, classStale := pruneDeleted(true)
 	if !resStale {
 		t.Error("deleted resource must invalidate the linked resources")
 	}
@@ -228,7 +228,7 @@ func TestPruneDeletedRemovesInnerClasses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resStale, classStale := pruneDeleted()
+	resStale, classStale := pruneDeleted(true)
 	if resStale {
 		t.Error("deleted source must not invalidate resources")
 	}
@@ -258,5 +258,43 @@ func TestPruneDeletedRemovesInnerClasses(t *testing.T) {
 	}
 	if _, ok := DataTable.Timestamps[foo]; ok {
 		t.Error("record of the deleted source must be dropped")
+	}
+}
+
+// A dependency is not an input of the dex of the project above API 21, so losing one has to
+// leave the sources alone: forcing them through d8 for a jar the bundle drops on its own is
+// the cost the split exists to remove. Below API 21 everything shares one merge, and there a
+// deleted jar really does stale the dex.
+func TestPruneDeletedJarFollowsTheDexLayout(t *testing.T) {
+	cases := []struct {
+		name       string
+		depsMerged bool
+		wantClass  bool
+	}{
+		{"api 21", false, false},
+		{"api 19", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupProject(t)
+			jarFile := filepath.Join("jar", "dep-1.0.jar")
+			writeFile(t, jarFile)
+			seedTable(t, "apk", map[string]int64{jarFile: modTimeOf(t, jarFile)})
+
+			if err := os.Remove(jarFile); err != nil {
+				t.Fatal(err)
+			}
+			resStale, classStale := pruneDeleted(tc.depsMerged)
+
+			if resStale {
+				t.Error("a deleted jar never invalidates the linked resources")
+			}
+			if classStale != tc.wantClass {
+				t.Errorf("classStale = %v, want %v", classStale, tc.wantClass)
+			}
+			if _, ok := DataTable.Timestamps[jarFile]; ok {
+				t.Error("record of the deleted jar must be dropped")
+			}
+		})
 	}
 }

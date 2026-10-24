@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,29 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// fileSHA1 is the content key of the per jar dex cache: the same bytes always
+// produce the same name, so a dependency that did not change is never dexed
+// again and a stale entry is impossible without looking at timestamps.
+func fileSHA1(filePath string) (string, error) {
+	fh, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer fh.Close()
+
+	hash := sha1.New()
+	if _, err := io.Copy(hash, fh); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// sha1Text is the digest of a string, the way fileSHA1 is the digest of a file.
+func sha1Text(text string) string {
+	sum := sha1.Sum([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
 
 // prompt prints the text and returns the string user entered. if empty then defaultValue is returned.
 func prompt(text string, defaultValue string) string {
@@ -28,6 +53,29 @@ func prompt(text string, defaultValue string) string {
 type Data struct {
 	Type       string           `json:"type"`
 	Timestamps map[string]int64 `json:"timestamps"`
+	// DexInputs is what the last merge got from jar/, as a digest of the jar
+	// contents. Timestamps cannot answer that question: a dependency rewritten
+	// with the same bytes is not a change, and one replaced with older timestamps
+	// is.
+	DexInputs string `json:"dexInputs,omitempty"`
+	// ManifestDigest is the content of AndroidManifest.xml the last build read.
+	// The manifest decides what every resource and source has to do again, so
+	// telling a real edit from a copy of the same bytes matters more here than
+	// anywhere else in the project.
+	ManifestDigest string `json:"manifestDigest,omitempty"`
+	// AuxInputs names the lib/ and assets/ roster the last bundle copied, as a
+	// digest of those names and bytes. Those trees only reach the apk when the
+	// bundle is rebuilt, so an addition or a deletion has to force it.
+	AuxInputs string `json:"auxInputs,omitempty"`
+	// BundleSha1 is the content of build/bundle.zip the apk was aligned and signed
+	// from. zipalign and apksigner are two java starts plus a full rewrite of the
+	// package, so they only run again when those bytes changed.
+	BundleSha1 string `json:"bundleSha1,omitempty"`
+	// BundleEntries maps each entry name of the last bundle to the digest of the
+	// file that produced it. An entry whose source still hashes the same is copied
+	// into the new zip as it is, which is what keeps a one line edit from
+	// recompressing a hundred megabytes of assets that did not change.
+	BundleEntries map[string]string `json:"bundleEntries,omitempty"`
 }
 
 const DataFile = "build/incremental.json"
@@ -39,13 +87,20 @@ func exists(filePath string) bool {
 	return err == nil
 }
 
+// saveTable writes the incremental state. It goes through a temporary file and a
+// rename because a build killed by the out of memory killer of this device used to
+// be able to leave a truncated json behind, which the next run then refuses to read.
 func saveTable() {
 	b, err := json.Marshal(DataTable)
 	if err != nil {
 		LogF("Incremental", "Marshal", err.Error())
 	}
-	if err := os.WriteFile(DataFile, b, 0644); err != nil {
+	tmp := DataFile + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		LogF("Incremental", "Write", err.Error())
+	}
+	if err := os.Rename(tmp, DataFile); err != nil {
+		LogF("Incremental", "Rename", err.Error())
 	}
 }
 
@@ -119,7 +174,6 @@ func updateRecords(files []string) {
 		}
 		DataTable.Timestamps[file] = modTime
 	}
-	saveTable()
 }
 
 func markAsChanged(files []string) {
@@ -141,7 +195,10 @@ func rootDir(path string) string {
 // pruneDeleted forgets tracked files that are gone and removes the artifacts
 // they produced, otherwise a deleted class or resource keeps shipping inside
 // the apk. It reports whether linked resources or dexed classes went stale.
-func pruneDeleted() (resStale bool, classStale bool) {
+// depsMerged says whether jar/ is an input of the one dex the project shares:
+// above API 21 the dependencies go to their own dexes, and taking one away is
+// the bundle's problem, not a reason to pass the sources through d8 again.
+func pruneDeleted(depsMerged bool) (resStale bool, classStale bool) {
 	for file := range DataTable.Timestamps {
 		if exists(file) {
 			continue
@@ -163,7 +220,9 @@ func pruneDeleted() (resStale bool, classStale bool) {
 				classStale = true
 			}
 		case "jar":
-			classStale = true
+			if depsMerged {
+				classStale = true
+			}
 		case "lib", "assets":
 			// these only feed buildBundle, and any stale flag forces it
 			resStale = true
