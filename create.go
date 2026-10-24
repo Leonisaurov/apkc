@@ -31,7 +31,10 @@ func create() {
 	name := prompt("App name (My App): ", "My App")
 
 	mustMkdir := func(path string) {
-		if err := os.Mkdir(path, 0755); err != nil {
+		// MkdirAll and not Mkdir: starting a project in a directory that already
+		// exists, the current one or one a checkout put there first, is the usual
+		// way in, and "mkdir .: file exists" is not an answer to that
+		if err := os.MkdirAll(path, 0755); err != nil {
 			LogF("create", err)
 		}
 	}
