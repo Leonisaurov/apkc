@@ -1,0 +1,7 @@
+# config local del agente: en el repo de la herramienta se versionan settings.json y
+# los skills, aqui solo hay el fichero local
+.qoder/settings.local.json
+.qoder/sessions/
+
+# volcado de protocolo del runner rish, de depuracion
+log.txt
