@@ -66,7 +66,7 @@ func _build(o buildOpts) {
 	// API 1 and rewrites every lambda of every dependency
 	api := manifestMinAPI()
 
-	var settedType, resStale, classStale, manifestStale bool
+	var settedType, resStale, classStale, manifestStale, apiChanged bool
 	firstRun := false
 	if o.incremental {
 		// without any record the whole build dir must be treated as missing,
@@ -78,6 +78,10 @@ func _build(o buildOpts) {
 			settedType = setCompilationType("apk")
 		}
 		resStale, classStale = pruneDeleted(api < 21)
+		// the api level is an input of the project dex: --min-api decides how much
+		// of the sources d8 desugars, so a minSdkVersion edit has to dex them again
+		// even when no source changed (DataTable is loaded by the calls above)
+		apiChanged = api != DataTable.AppApi
 	}
 
 	if settedType {
@@ -167,9 +171,14 @@ func _build(o buildOpts) {
 	// below API 21 the jars are inputs of the one merge, so there a dependency does
 	// change the dex the project shares with them, and it has to be dexed again
 	appStale := !o.incremental || firstRun || settedType || compSource || classStale ||
-		(depChanged && !splitDeps) || dexMissing
+		apiChanged || (depChanged && !splitDeps) || dexMissing
 	if appStale {
 		bundleJava(api, jars, splitDeps, classes)
+		if o.incremental && len(classes) > 0 {
+			// recorded only when a dex was really written: an empty src/ produces
+			// nothing to attribute to this api level
+			DataTable.AppApi = api
+		}
 	}
 
 	// the copied trees decide the bundle by their roster, and a bundle that is not

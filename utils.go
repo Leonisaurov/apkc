@@ -67,6 +67,12 @@ type Data struct {
 	// digest of those names and bytes. Those trees only reach the apk when the
 	// bundle is rebuilt, so an addition or a deletion has to force it.
 	AuxInputs string `json:"auxInputs,omitempty"`
+	// AppApi is the minSdkVersion the dex of the project was produced with. d8
+	// desugars according to --min-api, so a minSdkVersion edit changes the bytes of
+	// build/classes.dex even when not a single source did, and nothing else in this
+	// table notices: the fingerprint of jar/ does change with the api, but above 21
+	// it only decides the package, not the project dex.
+	AppApi int `json:"appApi,omitempty"`
 	// BundleSha1 is the content of build/bundle.zip the apk was aligned and signed
 	// from. zipalign and apksigner are two java starts plus a full rewrite of the
 	// package, so they only run again when those bytes changed.
