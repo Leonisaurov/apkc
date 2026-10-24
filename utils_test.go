@@ -188,10 +188,10 @@ func TestGetFilesJarExtensionFullSet(t *testing.T) {
 	writeFile(t, jar)
 	seedTable(t, "apk", map[string]string{jar: recorded(t, jar)})
 
-	if changed, _ := getFiles("jar", "jar", true); len(changed) != 0 {
+	if changed, _ := getFiles("jar", ".jar", true); len(changed) != 0 {
 		t.Fatalf("unchanged jar must not be reported as changed: %v", changed)
 	}
-	changed, _ := getFiles("jar", "jar", false)
+	changed, _ := getFiles("jar", ".jar", false)
 	if !equalStrings(changed, []string{jar}) {
 		t.Fatalf("classpath must contain every jar, got %v", changed)
 	}

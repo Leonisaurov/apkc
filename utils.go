@@ -315,7 +315,11 @@ func removeClasses(file string) bool {
 	return removed
 }
 
-// getFiles returns all the files in the path. if extension is not empty then that is also checked.
+// getFiles walks path and splits its files into the ones that have to be
+// compiled and the ones that do not. extension is a suffix with its dot (".java",
+// ".jar"), or empty to take every file. With incremental false nothing is decided
+// and everything lands in the first list, which is what a classpath needs: an
+// incremental subset there would silently drop dependencies.
 func getFiles(path string, extension string, incremental bool) ([]string, []string) {
 	changed_files := []string{}
 	unchanged_files := []string{}

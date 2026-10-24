@@ -386,22 +386,12 @@ func runRish() *appRun {
 // run builds the apk, installs it and follows the app output until it ends
 func run() {
 	runCmd := flag.NewFlagSet("run", flag.ExitOnError)
+	flags := registerBuildFlags(runCmd, false)
+	useRish := runCmd.Bool("rish", false, "install and follow the app through the Shizuku shell instead of adb")
 
-	useRish := runCmd.Bool("rish", false, "use rish to install the app instead of adb")
-	incremental := runCmd.Bool("inc", false, "run an incremental build before installing")
-	keyStore := runCmd.String("keystore", keyStorePath, "path to keystore")
-	storePass := runCmd.String("storepass", "android", "keystore password")
-	keyAlias := runCmd.String("keyalias", "androiddebugkey", "key alias to use")
-	sigAlg := runCmd.String("sigalg", "SHA256withRSA", "signature to use")
 	runCmd.Parse(os.Args[2:])
 
-	_build(buildOpts{
-		incremental: *incremental,
-		keyStore:    *keyStore,
-		storePass:   *storePass,
-		keyAlias:    *keyAlias,
-		sigAlg:      *sigAlg,
-	})
+	_build(flags.opts())
 
 	var started *appRun
 	if *useRish {
@@ -452,16 +442,12 @@ func addRecursive(w *fsnotify.Watcher, root string) {
 
 func watch() {
 	watchCmd := flag.NewFlagSet("watch", flag.ExitOnError)
-
-	useAAB := watchCmd.Bool("aab", false, "build aab instead of apk")
-	incremental := watchCmd.Bool("inc", false, "use the incremental build system")
-	useRish := watchCmd.Bool("rish", false, "use rish to install the app instead of adb")
+	flags := registerBuildFlags(watchCmd, true)
+	useRish := watchCmd.Bool("rish", false, "install and follow the app through the Shizuku shell instead of adb")
 	runEach := watchCmd.Bool("run", false, "install and follow the app after every rebuild")
-	keyStore := watchCmd.String("keystore", keyStorePath, "path to keystore")
-	storePass := watchCmd.String("storepass", "android", "keystore password")
-	keyAlias := watchCmd.String("keyalias", "androiddebugkey", "key alias to use")
-	sigAlg := watchCmd.String("sigalg", "SHA256withRSA", "signature to use")
 	watchCmd.Parse(os.Args[2:])
+
+	o := flags.opts()
 
 	// every round is a separate apkc process: a failed build aborts its own
 	// process with LogF, and the watcher survives to take the next change
@@ -470,21 +456,21 @@ func watch() {
 	if *runEach {
 		round = []string{"run"}
 	}
-	if *incremental {
+	if o.incremental {
 		args = append(args, "--inc")
 	}
 	if *useRish {
 		args = append(args, "--rish")
 	}
-	if *useAAB && !*runEach {
+	if o.useAAB && !*runEach {
 		args = append(args, "--aab")
 	}
-	if *useAAB && *runEach {
+	if o.useAAB && *runEach {
 		// run installs an apk, a bundle is not installable as is
 		LogW("watch", "--aab is ignored with --run, building apk instead")
 	}
-	args = append(args, "--keystore", *keyStore, "--storepass", *storePass,
-		"--keyalias", *keyAlias, "--sigalg", *sigAlg)
+	args = append(args, "--keystore", o.keyStore, "--storepass", o.storePass,
+		"--keyalias", o.keyAlias, "--sigalg", o.sigAlg)
 
 	self, err := os.Executable()
 	if err != nil {

@@ -36,25 +36,54 @@ type buildOpts struct {
 	sigAlg      string
 }
 
+// buildFlags are the command line switches that reach the stages. The three
+// entry points used to declare them one by one, which is how a default or a
+// description drifts apart between them, and how an option that belongs to the
+// build ends up missing from one of the others.
+type buildFlags struct {
+	useAAB      *bool
+	incremental *bool
+	keyStore    *string
+	storePass   *string
+	keyAlias    *string
+	sigAlg      *string
+}
+
+func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
+	f := buildFlags{}
+	if withAAB {
+		// only the callers that can produce a bundle offer the switch: run, and
+		// watch --run, install an apk, and a bundle is not installable as is
+		f.useAAB = set.Bool("aab", false, "build an app bundle instead of an apk")
+	}
+	f.incremental = set.Bool("inc", false, "use the incremental build system")
+	f.keyStore = set.String("keystore", keyStorePath, "path to the keystore")
+	f.storePass = set.String("storepass", "android", "keystore password")
+	f.keyAlias = set.String("keyalias", "androiddebugkey", "key alias to use")
+	f.sigAlg = set.String("sigalg", "SHA256withRSA", "signature algorithm to use")
+	return f
+}
+
+func (f buildFlags) opts() buildOpts {
+	o := buildOpts{
+		incremental: *f.incremental,
+		keyStore:    *f.keyStore,
+		storePass:   *f.storePass,
+		keyAlias:    *f.keyAlias,
+		sigAlg:      *f.sigAlg,
+	}
+	if f.useAAB != nil {
+		o.useAAB = *f.useAAB
+	}
+	return o
+}
+
 func build() {
 	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
-
-	useAAB := buildCmd.Bool("aab", false, "build aab instead of apk")
-	incremental := buildCmd.Bool("inc", false, "Use the incremental build system.")
-	keyStore := buildCmd.String("keystore", keyStorePath, "path to keystore")
-	storePass := buildCmd.String("storepass", "android", "keystore password")
-	keyAlias := buildCmd.String("keyalias", "androiddebugkey", "key alias to use")
-	sigAlg := buildCmd.String("sigalg", "SHA256withRSA", "signature to use")
+	flags := registerBuildFlags(buildCmd, true)
 
 	buildCmd.Parse(os.Args[2:])
-	_build(buildOpts{
-		useAAB:      *useAAB,
-		incremental: *incremental,
-		keyStore:    *keyStore,
-		storePass:   *storePass,
-		keyAlias:    *keyAlias,
-		sigAlg:      *sigAlg,
-	})
+	_build(flags.opts())
 }
 
 // build compiles all the source code and bundles into apk file with dependencies
@@ -72,16 +101,16 @@ func _build(o buildOpts) {
 	storedLibs, libsDeclared := manifestNativeLibsStored()
 	libs := nativeLibs{stored: storedLibs, declared: libsDeclared}
 
-	var settedType, resStale, classStale, manifestStale, apiChanged bool
+	var typeChanged, resStale, classStale, manifestStale, apiChanged bool
 	firstRun := false
 	if o.incremental {
 		// without any record the whole build dir must be treated as missing,
 		// even when every input looks unchanged
 		firstRun = !exists(DataFile)
 		if o.useAAB {
-			settedType = setCompilationType("aab")
+			typeChanged = setCompilationType("aab")
 		} else {
-			settedType = setCompilationType("apk")
+			typeChanged = setCompilationType("apk")
 		}
 		resStale, classStale = pruneDeleted(api < 21)
 		// the api level is an input of the project dex: --min-api decides how much
@@ -90,8 +119,8 @@ func _build(o buildOpts) {
 		apiChanged = api != DataTable.AppApi
 	}
 
-	if settedType {
-		LogI("Diagnostic", "Detected proyect type changed.", "Rebuilding.")
+	if typeChanged {
+		LogI("Diagnostic", "The project type changed.", "Rebuilding.")
 	}
 
 	// The manifest is an input of the link and of nothing else. `aapt2 compile`
@@ -123,14 +152,14 @@ func _build(o buildOpts) {
 	if o.incremental && compRes {
 		saveTable()
 	}
-	if !o.incremental || firstRun || settedType || compRes || resStale || resMissing || manifestStale {
+	if !o.incremental || firstRun || typeChanged || compRes || resStale || resMissing || manifestStale {
 		// the files aapt generates were rewritten: the sources that read R.*
 		// constants have to go through javac again, because javac inlines them
 		// into the class files
 		if bundleRes(o.useAAB, o.incremental) {
-			_, unchanged := getFiles("src", "kt", true)
+			_, unchanged := getFiles("src", ".kt", true)
 			markAsChanged(unchanged)
-			_, unchanged = getFiles("src", "java", true)
+			_, unchanged = getFiles("src", ".java", true)
 			markAsChanged(unchanged)
 		}
 	}
@@ -176,7 +205,7 @@ func _build(o buildOpts) {
 	depChanged := depStale || fingerprint != DataTable.DexInputs
 	// below API 21 the jars are inputs of the one merge, so there a dependency does
 	// change the dex the project shares with them, and it has to be dexed again
-	appStale := !o.incremental || firstRun || settedType || compSource || classStale ||
+	appStale := !o.incremental || firstRun || typeChanged || compSource || classStale ||
 		apiChanged || (depChanged && !splitDeps) || dexMissing
 	if appStale {
 		bundleJava(api, jars, splitDeps, classes)
@@ -197,7 +226,7 @@ func _build(o buildOpts) {
 		auxStale = roster != DataTable.AuxInputs
 	}
 
-	needBundle := !o.incremental || firstRun || settedType || compRes || compSource || resStale || classStale ||
+	needBundle := !o.incremental || firstRun || typeChanged || compRes || compSource || resStale || classStale ||
 		manifestStale || depChanged || auxStale || resMissing || dexMissing || !exists("build/bundle.zip")
 	if needBundle {
 		buildBundle(o.useAAB, depDexes, auxDigests, libs)
@@ -434,7 +463,7 @@ func kotlinShortcomings(compiler string, jars []string) []string {
 
 func compileKotlin(incremental bool) bool {
 	defer timeIt("kotlinc")()
-	kotlins, _ := getFiles("src", "kt", incremental)
+	kotlins, _ := getFiles("src", ".kt", incremental)
 	if len(kotlins) < 1 {
 		return false
 	}
@@ -446,9 +475,9 @@ func compileKotlin(incremental bool) bool {
 	// because kotlin resolves against them without compiling them.
 	compiling := kotlins
 	if incremental {
-		compiling, _ = getFiles("src", "kt", false)
+		compiling, _ = getFiles("src", ".kt", false)
 	}
-	javas, _ := getFiles("src", "java", false)
+	javas, _ := getFiles("src", ".java", false)
 	if incremental {
 		LogD("Incremental", "kotlinc takes the whole module:", len(compiling), "kotlin files,",
 			len(javas), "java sources for resolution")
@@ -482,7 +511,7 @@ func compileKotlin(incremental bool) bool {
 // allJars returns every jar of the project. It is used for classpaths, where
 // an incremental subset would silently drop dependencies.
 func allJars() []string {
-	jars, _ := getFiles("jar", "jar", false)
+	jars, _ := getFiles("jar", ".jar", false)
 	return jars
 }
 
@@ -496,7 +525,7 @@ func classpath(entries []string) string {
 // compileJava compiles java files in src dir and uses jar files in the jar dir as classpath
 func compileJava(incremental bool) bool {
 	defer timeIt("javac")()
-	javas, _ := getFiles("src", "java", incremental)
+	javas, _ := getFiles("src", ".java", incremental)
 	if len(javas) < 1 {
 		return false
 	}
