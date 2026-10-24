@@ -103,14 +103,48 @@ func mainActivityFromManifest() (string, string) {
 	return manifest.Package, activityName
 }
 
-// rishStage is the path the Shizuku shell can read the apk from
+// rishStage is the path the device shell writes and reads the apk from
 const rishStage = "/data/local/tmp/.test-app.apk"
 
-// rish runs a command inside the device shell and returns its output
+// rish runs a command inside the device shell and returns its output. The
+// Shizuku shell exits 0 whatever the command did, so a caller has to judge the
+// returned text; err only covers rish itself failing to run.
 func rish(script string) (string, error) {
 	cmd := exec.Command("rish", "-c", script)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// stageApk pipes the built apk into the device shell. Termux can neither write
+// /data/local/tmp (owned by the shell uid) nor reach /sdcard (needs the storage
+// permission), so the file travels through rish's stdin instead of a path.
+func stageApk() {
+	path := filepath.Join("build", "app.apk")
+	info, err := os.Stat(path)
+	if err != nil {
+		LogF("run", err)
+	}
+
+	apk, err := os.Open(path)
+	if err != nil {
+		LogF("run", err)
+	}
+	defer apk.Close()
+
+	cmd := exec.Command("rish", "-c", "cat > "+rishStage+" && chmod 644 "+rishStage)
+	cmd.Stdin = apk
+	if out, err := cmd.CombinedOutput(); err != nil {
+		LogF("run", err, string(out))
+	}
+
+	// a broken pipe would leave a truncated apk that pm still tries to install
+	size, err := rish("wc -c < " + rishStage)
+	if err != nil {
+		LogF("run", err, size)
+	}
+	if size != strconv.FormatInt(info.Size(), 10) {
+		LogF("run", "the device shell received", size, "of", info.Size(), "bytes")
+	}
 }
 
 // runRish (re)installs apk through the Shizuku shell and streams its logcat
@@ -122,21 +156,13 @@ func runRish() *exec.Cmd {
 		LogF("run", "build/app.apk is missing. build the apk before running with rish")
 	}
 
-	// /sdcard is the only location Termux and the device shell share
-	cmd := exec.Command("cp", filepath.Join("build", "app.apk"), "/sdcard/.test-app.apk")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		LogF("run", err, string(out))
-	}
-
-	if out, err := rish("mv /sdcard/.test-app.apk " + rishStage + " && chmod 644 " + rishStage); err != nil {
-		LogF("run", err, out)
-	}
+	stageApk()
 
 	// -r keeps the app data and allows reinstalling over the running copy
-	if out, err := rish("pm install -r " + rishStage); err != nil {
+	out, err := rish("pm install -r " + rishStage)
+	if err != nil || strings.Contains(out, "Failure") || strings.Contains(out, "Error") {
 		rish("rm -f " + rishStage)
-		LogF("run", err, out)
+		LogF("run", "install failed:", out)
 	}
 	rish("rm -f " + rishStage)
 
@@ -144,34 +170,33 @@ func runRish() *exec.Cmd {
 
 	// launch activity
 	LogI("run", "launching main activity")
-	if out, err := rish(fmt.Sprintf("am start -W -S -n %s/%s", pkg, activityName)); err != nil {
-		LogF("run", err, out)
+	out, err = rish(fmt.Sprintf("am start -W -S -n %s/%s", pkg, activityName))
+	if err != nil || strings.Contains(out, "Error") || strings.Contains(out, "Exception") {
+		LogF("run", "launch failed:", out)
 	}
 
 	// get pid of app
 	var pid string
 	for i := 0; i < 5; i++ {
-		cmd = exec.Command("rish", "-c", "pidof -s "+pkg)
-		out, err = cmd.Output()
-		pid = strings.TrimSpace(string(out))
+		pid, _ = rish("pidof -s " + pkg)
 		if pid != "" {
 			break
 		}
 		LogE("run", "Can't get the app pid.")
 		LogI("run", fmt.Sprintf("[%d] Retrying...", i+1))
+		time.Sleep(200 * time.Millisecond)
 	}
 	if pid == "" {
 		LogF("run", "couldn't get the pid of", pkg)
 	}
 
 	// stream logcat for the pid
-	cmd = exec.Command("rish", "-c", "logcat -v color --pid "+pid)
+	cmd := exec.Command("rish", "-c", "logcat -v color --pid "+pid)
 	cmd.Stdin = os.Stdin
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	err = cmd.Start()
-	if err != nil {
-		LogF("run", err, string(out))
+	if err := cmd.Start(); err != nil {
+		LogF("run", err)
 	}
 	return cmd
 }
