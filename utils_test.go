@@ -40,7 +40,7 @@ func writeFile(t *testing.T, path string) {
 func seedTable(t *testing.T, buildType string, records map[string]string) {
 	t.Helper()
 
-	DataTable = Data{Type: buildType, Digests: records}
+	DataTable = Data{Version: stateVersion, Type: buildType, Digests: records}
 	b, err := json.Marshal(DataTable)
 	if err != nil {
 		t.Fatal(err)
@@ -99,6 +99,58 @@ func TestSetCompilationTypeChange(t *testing.T) {
 	}
 	if setCompilationType("aab") {
 		t.Fatal("aab -> aab must not report a type change")
+	}
+}
+
+// TestLoadTableDropsAStateOfAnotherVersion is what makes the format change of
+// this file safe: a state whose records answer another question cannot be read as
+// an answer, and one round that produces everything is cheaper than an apk that
+// decides it has nothing to do.
+func TestLoadTableDropsAStateOfAnotherVersion(t *testing.T) {
+	setupProject(t)
+
+	body := `{"version":3,"type":"apk","digests":{"src/com/myapp/Main.java":"aaaa"},"manifestDigest":"bbbb","bundleSha1":"cccc"}`
+	if err := os.WriteFile(DataFile, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	loadTable()
+	if DataTable.Version != stateVersion {
+		t.Fatalf("version = %d, want this build's %d", DataTable.Version, stateVersion)
+	}
+	if len(DataTable.Digests) != 0 {
+		t.Errorf("records of another version must not be trusted, got %v", DataTable.Digests)
+	}
+	if DataTable.ManifestDigest != "" || DataTable.BundleSha1 != "" {
+		t.Error("the digests that gate the link and the signature must go with the records")
+	}
+	// the build type is not a record of staleness: the project did not change
+	// shape, it only has to be built again
+	if DataTable.Type != "apk" {
+		t.Errorf("type = %q, want apk kept", DataTable.Type)
+	}
+	if setCompilationType("apk") {
+		t.Error("a state only upgraded in version must not report a change of shape")
+	}
+}
+
+func TestSaveTableCarriesTheVersion(t *testing.T) {
+	setupProject(t)
+	seedTable(t, "apk", map[string]string{})
+
+	b, err := os.ReadFile(DataFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"version":4`) {
+		t.Fatalf("the state must name the shape it is, got %s", b)
+	}
+
+	// and a state this build wrote is read whole, not dropped
+	DataTable = Data{}
+	loadTable()
+	if DataTable.Version != stateVersion || len(DataTable.Digests) != 0 || DataTable.Digests == nil {
+		t.Fatalf("a state of this version must load as it was written: %+v", DataTable)
 	}
 }
 

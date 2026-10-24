@@ -50,8 +50,18 @@ func prompt(text string, defaultValue string) string {
 	return defaultValue
 }
 
+// stateVersion is the shape of build/incremental.json this apkc writes and the
+// only shape it trusts. Every time the meaning of a record changed the state had
+// to say so: 1 kept mtimes, 2 added the jar fingerprint and the manifest digest,
+// 3 the bundle entries and the api of the project dex, 4 records every tracked
+// file by content instead of by timestamp. A file from another version is not an
+// error and not a downgrade either: its records are dropped, one round produces
+// everything again, and the next state is whole.
+const stateVersion = 4
+
 type Data struct {
-	Type string `json:"type"`
+	Version int    `json:"version"`
+	Type    string `json:"type"`
 	// Digests is the content every tracked file had when it was last compiled:
 	// sources, resources and the java aapt generates. A timestamp cannot answer
 	// whether the bytes changed, in either direction: an editor or a tool that
@@ -144,6 +154,14 @@ func loadTable() {
 			LogW("Incremental", "the state file is not readable, deciding everything by its bytes again", err.Error())
 			DataTable = Data{}
 		}
+	}
+	if DataTable.Version != stateVersion {
+		// the records of another version answer a different question, so none of
+		// them can be trusted. The build type is kept on purpose: the project did
+		// not change shape, and setCompilationType must not report a rebuild that
+		// is really this: one round producing everything again.
+		LogD("Incremental", "state version", DataTable.Version, "is not", stateVersion, ": records dropped, everything gets produced again")
+		DataTable = Data{Version: stateVersion, Type: DataTable.Type}
 	}
 	if DataTable.Digests == nil {
 		DataTable.Digests = map[string]string{}
