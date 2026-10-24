@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,8 +15,27 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// run (re)installs apk and runs the main activity
-func runAdb() *exec.Cmd {
+// appRun is a launched app: the stream apkc is following, plus what is needed to
+// ask the device for the app's own log after that stream ended. An app that dies
+// takes its stdout with it, so without the second question the last thing the
+// user sees of a crash is nothing.
+type appRun struct {
+	cmd    *exec.Cmd
+	answer deviceAnswer
+	pkg    string
+	marker string
+}
+
+// reportAfterEnd prints what the device still holds when the app is not running.
+func (r *appRun) reportAfterEnd() {
+	if pid, _ := r.answer("pidof -s " + r.pkg); isDigits(pid) {
+		return
+	}
+	reportDeath(r.answer, r.pkg, r.marker, "the stream ended and the process is gone")
+}
+
+// runAdb (re)installs the apk over adb and runs the main activity
+func runAdb() *appRun {
 	// get list of all devices
 	cmd := exec.Command(adbPath, "devices")
 	out, err := cmd.Output()
@@ -42,6 +62,7 @@ func runAdb() *exec.Cmd {
 
 	device := strings.Split(devices[deviceNum-1], "\t")
 	serial := device[0]
+	answer := adbAnswer(serial)
 
 	// install apk in the device
 	LogI("run", "installing in", device[1]+"("+device[0]+")")
@@ -55,32 +76,186 @@ func runAdb() *exec.Cmd {
 	// collect package name and activity name from manifest
 	pkg, activityName := mainActivityFromManifest()
 
-	// launch activity
+	// the log window opens before the launch: an app that dies in onCreate leaves
+	// no pid behind, and then the only way to its stack is the window itself
+	marker := deviceTimestamp(answer)
+
 	LogI("run", "launching main activity")
-	cmd = exec.Command(adbPath, "shell", "am", "start", "-W", "-S", "-n", fmt.Sprintf("%s/%s", pkg, activityName))
-	out, err = cmd.CombinedOutput()
+	out, err = exec.Command(adbPath, "-s", serial, "shell", fmt.Sprintf("am start -W -S -n %s/%s", pkg, activityName)).CombinedOutput()
 	if err != nil {
 		LogF("run", err, string(out))
 	}
-
-	// get pid of app
-	cmd = exec.Command(adbPath, "shell", "pidof", "-s", pkg)
-	out, err = cmd.Output()
-	if err != nil {
-		LogF("run", err, string(out))
+	// adb reports the outcome of the start in its answer, and its exit code says
+	// nothing about the app
+	if reason, failed := launchFailed(string(out)); failed {
+		reportDeath(answer, pkg, marker, reason)
+		LogF("run", "launch failed")
 	}
-	pid := strings.TrimSpace(string(out))
 
-	// stream logcat for the pid
-	cmd = exec.Command(adbPath, "logcat", "-v", "color", "--pid", pid)
+	pid, _ := answer("pidof -s " + pkg)
+	if !isDigits(pid) {
+		reportDeath(answer, pkg, marker, "pidof found no process for "+pkg)
+		LogF("run", "the app did not survive its start")
+	}
+
+	// stream logcat for the pid, on the device that was picked: -s belongs on
+	// every call, or a second device makes adb refuse the launch and the log
+	cmd = exec.Command(adbPath, "-s", serial, "logcat", "-v", "color", "--pid", pid)
 	cmd.Stdin = os.Stdin
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	err = cmd.Start()
-	if err != nil {
-		LogF("run", err, string(out))
+	if err := cmd.Start(); err != nil {
+		LogF("run", err)
 	}
-	return cmd
+	return &appRun{cmd: cmd, answer: answer, pkg: pkg, marker: marker}
+}
+
+// deviceAnswer runs one command inside the device shell and returns its whole
+// answer. Two implementations: adb against a serial, and the Shizuku shell. The
+// error is only the transport: rish exits 0 whatever the device command did, so
+// a caller has to judge the text.
+type deviceAnswer func(script string) (string, error)
+
+func adbAnswer(serial string) deviceAnswer {
+	return func(script string) (string, error) {
+		out, err := exec.Command(adbPath, "-s", serial, "shell", script).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+}
+
+// deviceClock is the only shape logcat -T accepts for a starting point.
+var deviceClock = regexp.MustCompile(`[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}`)
+
+// deviceTimestamp is the device clock in the only format logcat -T reads. It is
+// taken before the launch so the window can be asked for after the app died,
+// without clearing anything the user still needs from before this run.
+func deviceTimestamp(answer deviceAnswer) string {
+	out, err := answer("date '+%m-%d %H:%M:%S.000'")
+	if err != nil {
+		LogD("run", "the device clock is not readable, the log window will be the whole buffer")
+		return ""
+	}
+
+	// only the clock shape travels on: the marker is quoted inside a command run
+	// on the device, so nothing that is not MM-DD HH:MM:SS.mmm may reach it
+	return deviceClock.FindString(out)
+}
+
+// logcatWindow is the dump of what the device still holds since the marker: the
+// crash buffer first, because it is small and holds exactly the stack of a start
+// that never finished, then the lines of the main buffer that belong to the app.
+func logcatWindow(answer deviceAnswer, pkg, marker string) []string {
+	from := ""
+	if marker != "" {
+		from = " -T '" + marker + "'"
+	}
+
+	crash, _ := answer("logcat -d -b crash -v threadtime" + from)
+	window, _ := answer("logcat -d -v threadtime" + from)
+	live, _ := answer("pidof -s " + pkg)
+
+	report := appWindowLines(window, pkg, live)
+	lines := []string{}
+	if text := strings.TrimSpace(crash); text != "" {
+		lines = append(lines, text)
+	}
+	return append(lines, report...)
+}
+
+var (
+	// procStart and procDeath name the pid the app had, from the ActivityManager
+	// lines around it: pidof cannot answer once the process is gone, and those
+	// lines are the only record of what it was while it lived.
+	procStart  = regexp.MustCompile(`Start proc ([0-9]+)`)
+	procDeath  = regexp.MustCompile(`\(pid ([0-9]+)\)`)
+	threadtime = regexp.MustCompile(`^[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}`)
+)
+
+// appWindowLines keeps the lines of a logcat threadtime dump that belong to the
+// app: its live pid if it has one, any pid the ActivityManager names next to our
+// package, and the continuation lines (stack traces) that follow such a record.
+// A line without the threadtime prefix is not a new record, so it stays with the
+// record before it, which is what keeps a FATAL EXCEPTION readable.
+func appWindowLines(dump, pkg, livePid string) []string {
+	pids := map[string]bool{}
+	if pid := strings.TrimSpace(livePid); isDigits(pid) {
+		pids[pid] = true
+	}
+
+	lines := []string{}
+	ours := false
+	for _, line := range strings.Split(dump, "\n") {
+		if !threadtime.MatchString(line) {
+			if ours && strings.TrimSpace(line) != "" {
+				lines = append(lines, line)
+			}
+			continue
+		}
+
+		mine := strings.Contains(line, pkg)
+		if fields := strings.Fields(line); len(fields) > 3 && pids[fields[2]] {
+			mine = true
+		}
+		if mine {
+			for _, re := range []*regexp.Regexp{procStart, procDeath} {
+				if found := re.FindStringSubmatch(line); found != nil {
+					pids[found[1]] = true
+				}
+			}
+		}
+		ours = mine
+		if mine {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func isDigits(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, r := range text {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// reportDeath says out loud that the app is not running, and prints what the
+// device still holds about it. Without this the user of a start that crashed in
+// onCreate gets "couldn't get the pid" and no line of the stack that caused it.
+func reportDeath(answer deviceAnswer, pkg, marker string, reason string) {
+	LogE("run", "the app is not running:", reason)
+	lines := logcatWindow(answer, pkg, marker)
+	if len(lines) == 0 {
+		LogW("run", "the device kept nothing about", pkg, "in this window")
+		return
+	}
+
+	LogI("run", "what the device holds about", pkg)
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+}
+
+// launchFailed reads the answer of `am start -W`, which reports its own outcome
+// and does it in text: the exit code of the shell says nothing about the app.
+func launchFailed(out string) (string, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		text := strings.TrimSpace(line)
+		if strings.HasPrefix(text, "Status:") && !strings.Contains(text, "ok") {
+			return text, true
+		}
+		// am writes "Error: type=..." and "Error type 3" and "Error: Activity
+		// class ... does not exist.", so the prefix is the word, not the colon:
+		// a start that never happened must not be streamed over
+		if strings.HasPrefix(text, "Error") || strings.Contains(text, "Exception") {
+			return text, true
+		}
+	}
+	return "", false
 }
 
 // mainActivityFromManifest returns the package name and the launchable activity
@@ -148,7 +323,7 @@ func stageApk() {
 }
 
 // runRish (re)installs apk through the Shizuku shell and streams its logcat
-func runRish() *exec.Cmd {
+func runRish() *appRun {
 	if _, err := exec.LookPath("rish"); err != nil {
 		LogF("run", "rish not found. enable the Shizuku shell first")
 	}
@@ -168,26 +343,33 @@ func runRish() *exec.Cmd {
 
 	pkg, activityName := mainActivityFromManifest()
 
-	// launch activity
+	// the window opens before the launch, so a start that died in onCreate still
+	// has its stack in the buffer to be asked for
+	marker := deviceTimestamp(rish)
+
 	LogI("run", "launching main activity")
 	out, err = rish(fmt.Sprintf("am start -W -S -n %s/%s", pkg, activityName))
-	if err != nil || strings.Contains(out, "Error") || strings.Contains(out, "Exception") {
-		LogF("run", "launch failed:", out)
+	if err != nil {
+		LogF("run", "the Shizuku shell did not answer:", out)
+	}
+	if reason, failed := launchFailed(out); failed {
+		reportDeath(rish, pkg, marker, reason)
+		LogF("run", "launch failed")
 	}
 
-	// get pid of app
-	var pid string
+	// the process may still be starting when am answers, so the pid is waited
+	// for; if it never shows up the app is not running, and the window says why
+	pid := ""
 	for i := 0; i < 5; i++ {
 		pid, _ = rish("pidof -s " + pkg)
-		if pid != "" {
+		if isDigits(pid) {
 			break
 		}
-		LogE("run", "Can't get the app pid.")
-		LogI("run", fmt.Sprintf("[%d] Retrying...", i+1))
 		time.Sleep(200 * time.Millisecond)
 	}
-	if pid == "" {
-		LogF("run", "couldn't get the pid of", pkg)
+	if !isDigits(pid) {
+		reportDeath(rish, pkg, marker, "no process for "+pkg+" after a second of trying")
+		LogF("run", "the app did not survive its start")
 	}
 
 	// stream logcat for the pid
@@ -198,7 +380,7 @@ func runRish() *exec.Cmd {
 	if err := cmd.Start(); err != nil {
 		LogF("run", err)
 	}
-	return cmd
+	return &appRun{cmd: cmd, answer: rish, pkg: pkg, marker: marker}
 }
 
 // run builds the apk, installs it and follows the app output until it ends
@@ -221,13 +403,16 @@ func run() {
 		sigAlg:      *sigAlg,
 	})
 
-	var cmd *exec.Cmd
+	var started *appRun
 	if *useRish {
-		cmd = runRish()
+		started = runRish()
 	} else {
-		cmd = runAdb()
+		started = runAdb()
 	}
-	cmd.Wait()
+	started.cmd.Wait()
+	// the stream ends when the app dies, and the app is what the user was
+	// waiting to hear from: ask the device for its log before saying nothing
+	started.reportAfterEnd()
 }
 
 // isGenerated reports whether a path is apkc output or tool state. Watching
