@@ -41,7 +41,7 @@ commands:
 doctor - check if Android sdk is accessible
 create - create a new project
 build  - build apk (--inc for an incremental build, --aab for an app bundle,
-         --core-library to let d8 dex java.* classes)
+         --core-library to let d8 dex java.* classes, --signer go|jvm)
 run    - build apk and run it on an available device (--inc, --rish)
 watch  - rebuild on every change (--inc, --run installs and follows the app)
 clean  - delete build/ dir

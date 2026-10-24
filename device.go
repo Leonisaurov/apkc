@@ -462,6 +462,9 @@ func watch() {
 	if o.coreLibrary {
 		args = append(args, "--core-library")
 	}
+	if o.signer != signerJVM {
+		args = append(args, "--signer", o.signer)
+	}
 	if *useRish {
 		args = append(args, "--rish")
 	}

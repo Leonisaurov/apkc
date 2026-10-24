@@ -35,6 +35,9 @@ type buildOpts struct {
 	storePass   string
 	keyAlias    string
 	sigAlg      string
+	// signer picks who turns the plan into an apk: the JVM tools apkc has always
+	// shelled out to, or the packager inside this binary
+	signer string
 }
 
 // buildFlags are the command line switches that reach the stages. The three
@@ -49,6 +52,7 @@ type buildFlags struct {
 	storePass   *string
 	keyAlias    *string
 	sigAlg      *string
+	signer      *string
 }
 
 func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
@@ -64,6 +68,7 @@ func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
 	f.storePass = set.String("storepass", "android", "keystore password")
 	f.keyAlias = set.String("keyalias", "androiddebugkey", "key alias to use")
 	f.sigAlg = set.String("sigalg", "SHA256withRSA", "signature algorithm to use")
+	f.signer = set.String("signer", signerJVM, "packaging and signing backend: jvm (zipalign and apksigner) or go (both inside apkc)")
 	return f
 }
 
@@ -75,6 +80,7 @@ func (f buildFlags) opts() buildOpts {
 		storePass:   *f.storePass,
 		keyAlias:    *f.keyAlias,
 		sigAlg:      *f.sigAlg,
+		signer:      *f.signer,
 	}
 	if f.useAAB != nil {
 		o.useAAB = *f.useAAB
@@ -233,7 +239,12 @@ func _build(o buildOpts) {
 	needBundle := !o.incremental || firstRun || typeChanged || compRes || compSource || resStale || classStale ||
 		manifestStale || depChanged || auxStale || resMissing || dexMissing || !exists("build/bundle.zip")
 	if needBundle {
-		buildBundle(o.useAAB, depDexes, auxDigests, libs)
+		if o.signer == signerGo && !o.useAAB {
+			// the package is written below, from the same plan: a bundle.zip that
+			// only exists to be read back and moved by zipalign would be wasted work
+		} else {
+			buildBundle(o.useAAB, depDexes, auxDigests, libs)
+		}
 		if o.incremental {
 			DataTable.AuxInputs = roster
 			// the bundle is what consumes a dependency set: recording the
@@ -254,6 +265,25 @@ func _build(o buildOpts) {
 		if needBundle || !exists("build/app.aab") {
 			buildAAB()
 			signAAB(o.keyStore, o.storePass, o.keyAlias, o.sigAlg)
+		}
+	} else if o.signer == signerGo {
+		if err := v2RefuseBelow(api); err != nil {
+			LogF("build", err)
+		}
+		apkOk := exists(filepath.Join("build", "app.apk"))
+		if needBundle || !apkOk {
+			defer timeIt("package and sign go")()
+			LogI("build", "packaging and signing inside apkc")
+			plan := packagePlan(o.useAAB, depDexes, auxDigests, libs)
+			reused, err := packageWithGo(plan, DataTable.BundleEntries, o.keyStore, o.storePass, o.keyAlias)
+			if err != nil {
+				LogF("build", err)
+			}
+			if reused > 0 {
+				LogD("build", "copied", reused, "entries from the previous package")
+			}
+		} else if o.incremental {
+			LogD("build", "the package did not change: the apk on disk stands")
 		}
 	} else {
 		packed := filepath.Join("build", "bundle.zip")
@@ -1056,9 +1086,12 @@ type nativeLibs struct {
 // recompressing a hundred and thirty six megabytes of assets that did not change.
 // The new package goes through a temporary file and a rename, because the previous one
 // is still open as the source of those raw copies while this one is being written.
-func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string, libs nativeLibs) {
-	defer timeIt("bundle zip")()
-
+// packagePlan is the list of files the package is made of, in the order they go in.
+// Both packagers read it: the JVM one writes it into bundle.zip for zipalign and
+// apksigner to rewrite afterwards, the Go one writes it straight into the apk with
+// the alignment each entry needs and signs it there. One list, so the two cannot
+// disagree about what is in the package or in which order.
+func packagePlan(useAAB bool, depDexes []string, auxDigests map[string]string, libs nativeLibs) []bundleEntry {
 	// the digest of a file, taken from the roster lib/ and assets/ already hashed
 	// when the bundle is being decided, so those trees are read once per build
 	digestOf := func(path string) string {
@@ -1140,6 +1173,13 @@ func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string, l
 	for _, f := range files {
 		add(f, f, !libs.stored)
 	}
+	return plan
+}
+
+func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string, libs nativeLibs) {
+	defer timeIt("bundle zip")()
+
+	plan := packagePlan(useAAB, depDexes, auxDigests, libs)
 
 	// opened before anything is written: the old package is the source of the raw
 	// copies, and it must keep its bytes while the new one is being built
