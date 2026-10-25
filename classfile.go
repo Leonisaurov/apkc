@@ -109,8 +109,9 @@ type classInfo struct {
 	// of a constant field. The code is not in it, so editing a body costs nobody a
 	// recompilation.
 	API string
-	// Refs are the classes named in the constant pool, project ones only after the
-	// index is whole.
+	// Refs are every class the constant pool names, platform and jar classes
+	// included: a caller of a class the project stopped compiling still carries its
+	// name, and that is what says the caller has work to do.
 	Refs []string
 }
 
