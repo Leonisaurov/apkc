@@ -18,9 +18,19 @@ var (
 	javaPath    string
 	javaBinPath string
 	javacPath   string
+	javaCmdPath string
+	// jarsigner is what signs a bundle: the same bin directory as javac, and
+	// nothing else on this device has it under that name
+	jarsignerPath string
 
 	// kotlin sdk paths
 	kotlincPath string
+
+	// bundletool is not part of build-tools: it is its own install, either an
+	// executable on PATH or a jar apkc has to start with java
+	bundletoolPath string
+	// bundletoolIsJar records which of the two the path above is
+	bundletoolIsJar bool
 
 	// android sdk paths
 	sdkPath       string
@@ -67,6 +77,20 @@ func doctor() {
 		LogI("doctor", "adb", adbPath)
 	} else {
 		LogD("doctor", "no adb: apkc run without --rish cannot reach a device")
+	}
+
+	// the .aab path needs two things no SDK search answers by itself
+	if bundletoolPath == "" {
+		LogD("doctor", "no bundletool: apkc build --aab cannot assemble a bundle")
+	} else if bundletoolIsJar {
+		LogI("doctor", "bundletool", bundletoolPath, "started with", javaCmdPath)
+	} else {
+		LogI("doctor", "bundletool", bundletoolPath)
+	}
+	if exists(jarsignerPath) || jarsignerPath == "jarsigner" {
+		LogI("doctor", "jarsigner", jarsignerPath)
+	} else {
+		LogW("doctor", "no jarsigner at", jarsignerPath, "- a bundle cannot be signed without it")
 	}
 	if _, err := exec.LookPath("rish"); err == nil {
 		LogI("doctor", "rish", "on PATH (Shizuku shell: apkc run --rish)")
@@ -119,13 +143,55 @@ func findSDKs() {
 	if javaPath != "" {
 		javaBinPath = filepath.Join(javaPath, "bin")
 		javacPath = filepath.Join(javaBinPath, "javac")
+		javaCmdPath = filepath.Join(javaBinPath, "java")
+		jarsignerPath = filepath.Join(javaBinPath, "jarsigner")
 	} else {
 		LogW("doctor", "JAVA_HOME was not found in environment")
 		// hope the bin is in path
 		javacPath = "javac"
+		javaCmdPath = "java"
+		jarsignerPath = "jarsigner"
 	}
 
 	kotlincPath = "kotlinc"
+
+	findBundletool()
+}
+
+// findBundletool answers how the bundle is assembled on this machine. bundletool
+// ships as a jar and distributions install it in different shapes, so both are
+// accepted: an executable called bundletool, or a jar somewhere under the SDK or the
+// home directory, which apkc then starts with java. The search is bounded on purpose
+// - walking a home tree on this device costs more than the one round that needs it.
+func findBundletool() {
+	if p, err := exec.LookPath("bundletool"); err == nil {
+		bundletoolPath, bundletoolIsJar = p, false
+		return
+	}
+
+	bases := []string{}
+	if sdkPath != "" {
+		bases = append(bases, filepath.Join(sdkPath, "bundletool"), sdkPath)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		bases = append(bases, filepath.Join(home, "Android", "bundletool"))
+	}
+
+	for _, base := range bases {
+		matches, err := filepath.Glob(filepath.Join(base, "bundletool*.jar"))
+		if err != nil {
+			continue
+		}
+		if len(matches) == 0 && base != "" {
+			// one level down, which is where a versioned directory puts it
+			matches, _ = filepath.Glob(filepath.Join(base, "*", "bundletool*.jar"))
+		}
+		sort.Strings(matches)
+		if len(matches) > 0 {
+			bundletoolPath, bundletoolIsJar = matches[len(matches)-1], true
+			return
+		}
+	}
 }
 
 // latestBuildTools checks the available build tools and picks the most recent one
