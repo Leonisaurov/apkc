@@ -56,10 +56,11 @@ func prompt(text string, defaultValue string) string {
 // 3 the bundle entries and the api of the project dex, 4 records every tracked
 // file by content instead of by timestamp, 5 the shape of each compiled class, 6
 // the constants each class presents, which is what a reader of one inlines into its
-// own bytes. A file from another version is not an error and not a downgrade either:
+// own bytes, 7 the SHA-256 of every packaged entry, which is what the JAR signature
+// digests. A file from another version is not an error and not a downgrade either:
 // its records are dropped, one round produces everything again, and the next state
 // is whole.
-const stateVersion = 6
+const stateVersion = 7
 
 type Data struct {
 	Version int    `json:"version"`
@@ -106,6 +107,11 @@ type Data struct {
 	// links, because the caller's own file did not change — only what it promised to
 	// the vm did. That question is what this table answers.
 	ClassAPI map[string]string `json:"classApi,omitempty"`
+	// EntrySha256 is the base64 SHA-256 of the bytes each entry of the last bundle
+	// carried. The JAR signature needs it for every file in the package, and an entry
+	// copied over from the previous package is never read again, so this is the only
+	// way to know its digest without inflating it.
+	EntrySha256 map[string]string `json:"entrySha256,omitempty"`
 	// ClassFields keeps the compile time constants each class presented, by
 	// "name:descriptor". javac copies those values into the bytes of whoever reads
 	// them, so a resource id that moved is a change for the sources that read that

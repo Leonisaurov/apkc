@@ -36,7 +36,8 @@ func TestPaddingAfterLandsDataOnTheBoundary(t *testing.T) {
 func TestHeadersOfAWrittenEntryAgreeWithItsDirectoryRecord(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "payload")
-	if err := os.WriteFile(src, []byte("some bytes for the entry\n"), 0644); err != nil {
+	payload := []byte("some bytes for the entry\n")
+	if err := os.WriteFile(src, payload, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -45,12 +46,17 @@ func TestHeadersOfAWrittenEntryAgreeWithItsDirectoryRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := []bundleEntry{{src: src, name: "assets/payload", compress: false, digest: "d1"}}
-	records, reused, err := writePackageEntries(out, plan, []bool{false}, nil)
+	records, reused, digests, err := writePackageEntries(out, plan, []bool{false}, nil, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reused != 0 {
 		t.Fatalf("a cold package reused %d entries", reused)
+	}
+	// the JAR signature digests what an entry holds, and this entry is stored: the
+	// digest the writer reports has to be the file's own bytes, not the archive's
+	if want := base64SHA256(payload); digests["assets/payload"] != want {
+		t.Errorf("the writer reported the content digest %q, want %q", digests["assets/payload"], want)
 	}
 	if err := out.Close(); err != nil {
 		t.Fatal(err)
@@ -117,7 +123,7 @@ func TestStoredEntryKeepsItsBytesAndCrc(t *testing.T) {
 	}
 
 	plan := []bundleEntry{{src: src, name: "lib/arm64-v8a/libx.so", compress: false, digest: "d"}}
-	records, _, err := writePackageEntries(out, plan, []bool{false}, nil)
+	records, _, _, err := writePackageEntries(out, plan, []bool{false}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -68,7 +68,7 @@ func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
 	f.storePass = set.String("storepass", "android", "keystore password")
 	f.keyAlias = set.String("keyalias", "androiddebugkey", "key alias to use")
 	f.sigAlg = set.String("sigalg", "SHA256withRSA", "signature algorithm to use")
-	f.signer = set.String("signer", signerJVM, "packaging and signing backend: jvm (zipalign and apksigner), go (both inside apkc, needs minSdkVersion 24 and a PKCS#12 keystore), or auto (go when both hold, jvm otherwise)")
+	f.signer = set.String("signer", signerJVM, "packaging and signing backend: jvm (zipalign and apksigner), go (v1 and v2 written inside apkc, needs a PKCS#12 keystore), or auto (go whenever it can, jvm otherwise)")
 	return f
 }
 
@@ -113,7 +113,7 @@ func _build(o buildOpts) {
 
 	// who writes the apk is decided by the api level and the keystore in front of it,
 	// before any stage asks: --signer=auto means exactly that
-	o.signer = resolveSigner(o.signer, api, o.keyStore, o.useAAB)
+	o.signer = resolveSigner(o.signer, o.keyStore, o.useAAB)
 
 	var typeChanged, resStale, classStale, manifestStale, apiChanged bool
 	firstRun := false
@@ -279,9 +279,6 @@ func _build(o buildOpts) {
 			signAAB(o.keyStore, o.storePass, o.keyAlias, o.sigAlg)
 		}
 	} else if o.signer == signerGo {
-		if err := v2RefuseBelow(api); err != nil {
-			LogF("build", err)
-		}
 		apkOk := exists(filepath.Join("build", "app.apk"))
 		if needBundle || !apkOk {
 			defer timeIt("package and sign go")()

@@ -14,42 +14,40 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // signer choices. jvm is the default and the one with years of production behind it;
-// go is the new path; auto lets the two facts that decide whether go is allowed speak
-// for themselves, which is what a wrapper passes once instead of thinking per project.
+// go is the other one; auto lets the facts that decide which of the two can serve the
+// project speak for themselves, which is what a wrapper passes once instead of thinking
+// per project.
 const (
 	signerJVM  = "jvm"
 	signerGo   = "go"
 	signerAuto = "auto"
-
-	// v2 is checked by the platform from API 24 up
-	minAPIForV2Only = 24
 )
 
 // resolveSigner turns the choice on the command line into the backend this build can
-// actually use, and says why for the ones auto settles by itself. The two conditions
-// are the two limits of the Go packager: a package under API 24 needs the JAR
-// signature it does not write, and a JKS keystore is a format it refuses to read.
+// actually use, and says why for the ones auto settles by itself.
 //
-// An explicit --signer=go is not second-guessed here: v2RefuseBelow is what tells the
-// user their chosen backend cannot serve the project.
-func resolveSigner(signer string, api int, keyPath string, useAAB bool) string {
+// What the Go packager cannot do is read a JKS keystore, and assemble a bundle at
+// all: those two, and nothing else. The api level used to be a third reason, while it
+// wrote no JAR signature; it writes one now, so a minSdkVersion of 19 is served by the
+// same code as one of 33.
+func resolveSigner(signer string, keyPath string, useAAB bool) string {
 	if signer != signerAuto {
 		return signer
 	}
 	switch {
 	case useAAB:
 		LogD("sign", "--signer=auto: a bundle is signed by jarsigner, so the jvm backend it is")
-		return signerJVM
-	case api < minAPIForV2Only:
-		LogD("sign", "--signer=auto: minSdkVersion", api, "needs the v1 signature only apksigner writes")
 		return signerJVM
 	case !keystoreIsPKCS12(keyPath):
 		LogD("sign", "--signer=auto:", keyPath, "is not a PKCS#12 keystore, and only the jvm backend reads the rest")
@@ -86,10 +84,19 @@ func packageWithGo(plan []bundleEntry, recorded map[string]string, keyPath, stor
 	defer out.Close()
 
 	reuse, entries := reusePlan(plan, previous.names, recorded)
-	records, reused, err := writePackageEntries(out, plan, reuse, previous)
+	records, reused, digests, err := writePackageEntries(out, plan, reuse, previous, DataTable.EntrySha256)
 	if err != nil {
 		return 0, err
 	}
+
+	// The JAR signature is part of the package: its three files have to be inside
+	// before the central directory is written, and before the signing block that
+	// covers every byte up to it.
+	signed, err := writeV1Entries(out, plan, digests, key, cert)
+	if err != nil {
+		return 0, err
+	}
+	records = append(records, signed...)
 
 	// the end record is hashed with the offset of the signing block in the field that
 	// will finally hold the offset of the central directory: that value changes every
@@ -133,7 +140,54 @@ func packageWithGo(plan []bundleEntry, recorded map[string]string, keyPath, stor
 	// the record of what the next build can copy over, kept here so the caller stores
 	// it only when the package really landed
 	DataTable.BundleEntries = entries
+	DataTable.EntrySha256 = digests
 	return reused, nil
+}
+
+// writeV1Entries appends META-INF/ANDROID.SF, META-INF/ANDROID.RSA and
+// META-INF/MANIFEST.MF, in the order apksigner writes them, and returns their records
+// for the central directory.
+//
+// A missing content digest is a failure rather than an omission: a manifest that
+// covers fewer files than the package holds is a signature that says nothing about the
+// rest of it, and it still verifies.
+func writeV1Entries(dst *os.File, plan []bundleEntry, digests map[string]string,
+	key *rsa.PrivateKey, cert *x509.Certificate) ([]packedRecord, error) {
+	files, missing := v1FilesOf(plan, digests)
+	if missing > 0 {
+		return nil, fmt.Errorf("%d entries of the package had no content digest to write down", missing)
+	}
+
+	manifest := jarManifest(files)
+	sf := signatureFile(manifest, []int{2})
+	block, err := pkcs7Signature(sf, key, cert)
+	if err != nil {
+		return nil, err
+	}
+
+	// the signature files are written now, so their date is this build's: there is
+	// no source file to be honest about, and a verifier does not compare them to one
+	when := dosTime(time.Now())
+	records := []packedRecord{}
+	for _, item := range []struct {
+		name    string
+		content []byte
+	}{
+		{v1SFEntry, sf},
+		{v1BlockEntry, block},
+		{v1ManifestEntry, manifest},
+	} {
+		offset, err := dst.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+		rec, err := writeMemoryEntry(dst, item.name, item.content, offset, when)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+	return records, nil
 }
 
 // openPreviousPackage indexes the package this one replaces: the offsets and the
@@ -180,13 +234,4 @@ func openPreviousPackage(path string) (*previousPackage, error) {
 	}
 	out.file = f
 	return out, nil
-}
-
-// v2RefuseBelow is the check that keeps the packager from producing an apk no device
-// of the project's own api level can install.
-func v2RefuseBelow(api int) error {
-	if api > 0 && api < minAPIForV2Only {
-		return fmt.Errorf("--signer=go signs with APK Signature Scheme v2 only, which Android checks from API %d up: this project has minSdkVersion %d, build it with --signer=jvm", minAPIForV2Only, api)
-	}
-	return nil
 }
