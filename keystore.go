@@ -28,19 +28,23 @@ func signingKey(path, password, alias string) (crypto.Signer, *x509.Certificate,
 		return nil, nil, fmt.Errorf("%s is a JKS keystore: the Go signer reads PKCS#12, convert it with keytool -importkeystore -storetype PKCS12 or build with --signer=jvm", path)
 	}
 
-	material, err := readPKCS12(blob, password)
+	material, err := readPKCS12(blob, password, alias)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// the bags carry no alias to select by, so the certificate is checked against
-	// what the caller asked for. A mismatch is reported rather than ignored:
-	// signing with another key of the same keystore produces an apk that installs
-	// once and then fails every update against the old signature.
-	if alias != "" && material.Cert.Subject.CommonName != "" && material.Cert.Subject.CommonName != alias {
-		LogW("sign", "the keystore offers", material.Cert.Subject.CommonName, "but", alias, "was asked for")
+	// An entry is named by the friendlyName its bag carries, not by the subject of
+	// its certificate: the debug keystore is androiddebugkey by name and CN=Android
+	// Debug by subject, so comparing the subject to the alias warned on every build
+	// of every project. A file that does name its entries and does not hold the one
+	// asked for is refused rather than answered with another identity: signing with a
+	// key the caller did not choose installs once and then fails every update against
+	// the old signature.
+	if alias != "" && material.Alias != alias && (material.Names || material.Keys > 1) {
+		return nil, nil, fmt.Errorf("%s holds %d key(s), the nearest name being %q, and none is %s: check --keyalias",
+			path, material.Keys, material.Alias, alias)
 	}
-	LogD("sign", "keystore", path, "certificate", material.Cert.Subject.CommonName,
+	LogD("sign", "keystore", path, "alias", material.Alias, "certificate", material.Cert.Subject.CommonName,
 		"valid to", material.Cert.NotAfter.Format("2006-01-02"), "mac algorithm", material.MacAlgo)
 
 	return material.Signer, material.Cert, nil

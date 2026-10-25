@@ -17,16 +17,19 @@ package main
 // signing tool starts producing signatures that verify against the wrong key.
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/pbkdf2"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash"
 	"strings"
+	"unicode/utf16"
 )
 
 // OIDs the format uses, as far as this reader goes.
@@ -44,6 +47,12 @@ var (
 	oidAES128CBC   = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
 	oidAES192CBC   = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 22}
 	oidAES256CBC   = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
+	// The alias of an entry is a bag attribute, and the two families of writers spell
+	// it differently: keytool puts it under a pkcs-9 id inside a SET OF, openssl and
+	// the Windows tools under the CSP friendlyName id as a bare string. Both are
+	// read; a name in neither place is simply "unnamed".
+	oidFriendlyNameJDK = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 20}
+	oidFriendlyNameCSP = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 17, 1}
 )
 
 type algoID struct {
@@ -80,10 +89,15 @@ type encryptedContentInfo struct {
 	Encrypted   asn1.RawValue `asn1:"tag:0,optional"`
 }
 
+// safeBag is one bag of a SafeContents. The attributes are the remaining bytes of
+// the bag, and Go's asn1 decodes them neither as a SET field of the struct nor as
+// the tag the writers actually use, so they are taken whole and walked here. Read
+// as a plain set they are simply never there, and every entry of a real keystore
+// looks unnamed.
 type safeBag struct {
 	OID   asn1.ObjectIdentifier
-	Bag   asn1.RawValue   `asn1:"tag:0,explicit"`
-	Attrs []asn1.RawValue `asn1:"optional,set"`
+	Bag   asn1.RawValue `asn1:"tag:0,explicit"`
+	Attrs asn1.RawValue `asn1:"optional,rest"`
 }
 
 type certBag struct {
@@ -113,14 +127,39 @@ type pbes2Params struct {
 type keyMaterial struct {
 	Signer crypto.Signer
 	Cert   *x509.Certificate
+	// Alias is the friendlyName of the entry the key came from, empty when the file
+	// carries none. It is what a caller comparing --keyalias has to compare against.
+	Alias string
+	// Keys counts the private key bags read, so a caller can tell "the one key this
+	// file has" from "one of several, picked because nothing named it".
+	Keys int
+	// Names says at least one bag carries a friendlyName. A file whose entries are
+	// named can be asked for one of them; an openssl produced one is a bare key, and
+	// asking it for an alias means nothing.
+	Names bool
 	// MacAlgo is reported, not verified: the OID of the digest the file's MAC was
 	// computed with. A user who converts a keystore and loses the key in the
 	// process at least sees which scheme the file claimed.
 	MacAlgo string
 }
 
-// readPKCS12 opens a PKCS#12 blob with the store password.
-func readPKCS12(blob []byte, password string) (keyMaterial, error) {
+// rawKey and rawCert are the two halves of an entry as the bags carry them, before
+// anything is chosen. A keystore of several keys is searched, not assumed.
+type rawKey struct {
+	alias string
+	der   []byte
+}
+
+type rawCert struct {
+	alias string
+	cert  *x509.Certificate
+}
+
+// readPKCS12 opens a PKCS#12 blob with the store password and returns the entry
+// named alias, falling back to the first key the file holds when nothing matches —
+// deciding whether that fallback is acceptable needs the file name, so it is the
+// caller's problem and keyMaterial reports what the file looked like.
+func readPKCS12(blob []byte, password, alias string) (keyMaterial, error) {
 	var file pfx
 	if _, err := asn1.Unmarshal(blob, &file); err != nil {
 		return keyMaterial{}, fmt.Errorf("not a PKCS#12 file: %v", err)
@@ -187,6 +226,8 @@ func readPKCS12(blob []byte, password string) (keyMaterial, error) {
 		}
 	}
 
+	var keys []rawKey
+	var certs []rawCert
 	for _, bag := range bags {
 		switch {
 		case bag.OID.Equal(oidShroudedBag):
@@ -201,13 +242,9 @@ func readPKCS12(blob []byte, password string) (keyMaterial, error) {
 			if err != nil {
 				return out, err
 			}
-			if err := out.takeKey(plaintext); err != nil {
-				return out, err
-			}
+			keys = append(keys, rawKey{bagAlias(bag.Attrs.Bytes), plaintext})
 		case bag.OID.Equal(oidKeyBag):
-			if err := out.takeKey(bag.Bag.Bytes); err != nil {
-				return out, err
-			}
+			keys = append(keys, rawKey{bagAlias(bag.Attrs.Bytes), bag.Bag.Bytes})
 		case bag.OID.Equal(oidCertBag):
 			var cb certBag
 			if _, err := asn1.Unmarshal(bag.Bag.Bytes, &cb); err != nil {
@@ -224,36 +261,196 @@ func readPKCS12(blob []byte, password string) (keyMaterial, error) {
 				// parse error that reads like a corrupt keystore
 				return out, fmt.Errorf("bag of certificate type %s is not a parsable X.509 certificate: %v", cb.OID, err)
 			}
-			if out.Cert == nil {
-				out.Cert = cert
-			}
+			certs = append(certs, rawCert{bagAlias(bag.Attrs.Bytes), cert})
 		}
 	}
 
-	if out.Signer == nil {
-		return out, errors.New("the keystore holds no private key apkc can use")
+	out.Keys = len(keys)
+	for _, k := range keys {
+		if k.alias != "" {
+			out.Names = true
+			break
+		}
 	}
-	if out.Cert == nil {
-		return out, errors.New("the keystore holds a key with no certificate")
+	for _, c := range certs {
+		if c.alias != "" {
+			out.Names = true
+			break
+		}
 	}
+	signer, cert, entry, err := pickEntry(keys, certs, alias)
+	if err != nil {
+		return out, err
+	}
+	out.Signer, out.Cert, out.Alias = signer, cert, entry
 	return out, nil
 }
 
-// takeKey reads a PKCS#8 PrivateKeyInfo, which is what both the plain and the
-// shrouded key bag carry once the bag is open.
-func (k *keyMaterial) takeKey(der []byte) error {
+// pickEntry answers the alias the caller asked for with a key and the certificate
+// that belongs to it.
+//
+// The pair is decided by public key, not by position: a keystore carries the bags
+// in whatever order the writer felt like, and signing with one entry's key while
+// shipping another's certificate produces an apk that installs once and then fails
+// every update against the old signature. The name of the entry comes with it,
+// because keytool writes the alias on the certificate bag and leaves the key bag
+// holding only a localKeyID: looking for the name on the key alone finds nothing in
+// the files that matter most.
+func pickEntry(keys []rawKey, certs []rawCert, alias string) (crypto.Signer, *x509.Certificate, string, error) {
+	if len(keys) == 0 {
+		return nil, nil, "", errors.New("the keystore holds no private key apkc can use")
+	}
+	if len(certs) == 0 {
+		return nil, nil, "", errors.New("the keystore holds a key with no certificate")
+	}
+
+	entries := []keystoreEntry{}
+	unread := error(nil)
+	for _, k := range keys {
+		signer, err := parsePrivateKey(k.der)
+		if err != nil {
+			// a bag this reader cannot open is kept as the reason to fail, but it does
+			// not hide the keys of the file that can be read
+			if unread == nil {
+				unread = err
+			}
+			continue
+		}
+		cert := matchCert(signer, certs)
+		name := k.alias
+		if name == "" && cert != nil {
+			name = cert.alias
+		}
+		entry := keystoreEntry{alias: name, signer: signer}
+		if cert != nil {
+			entry.cert = cert.cert
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return nil, nil, "", unread
+	}
+
+	chosen := entries[0]
+	for _, e := range entries {
+		if alias != "" && e.alias == alias {
+			chosen = e
+			break
+		}
+	}
+	if chosen.cert == nil {
+		if len(certs) > 1 {
+			// the certificate is the identity the platform matches an update against,
+			// so a file with several of them is not answered by taking whichever one
+			return nil, nil, "", fmt.Errorf("none of the %d certificates of the keystore carries the public key of %q",
+				len(certs), chosen.alias)
+		}
+		// one key and one certificate: the file cannot mean anything else, whatever
+		// the two encodings say
+		chosen.cert = certs[0].cert
+	}
+	return chosen.signer, chosen.cert, chosen.alias, nil
+}
+
+// keystoreEntry is one signing identity of a keystore: the key, the certificate that
+// goes with it, and the name the file gives the pair.
+type keystoreEntry struct {
+	alias  string
+	signer crypto.Signer
+	cert   *x509.Certificate
+}
+
+// matchCert finds the certificate of a key by its public key, and returns nil when
+// the file carries none for it.
+func matchCert(signer crypto.Signer, certs []rawCert) *rawCert {
+	public, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return nil
+	}
+	for i, c := range certs {
+		if bytes.Equal(c.cert.RawSubjectPublicKeyInfo, public) {
+			return &certs[i]
+		}
+	}
+	return nil
+}
+
+// parsePrivateKey reads a PKCS#8 PrivateKeyInfo, which is what both the plain and
+// the shrouded key bag carry once the bag is open.
+func parsePrivateKey(der []byte) (crypto.Signer, error) {
 	key, err := x509.ParsePKCS8PrivateKey(der)
 	if err != nil {
 		// a wrong storepass most often surfaces here, because CBC padding on a
 		// random key decodes to garbage far more often than to a parseable key
-		return fmt.Errorf("private key in the keystore could not be read (wrong storepass?): %v", err)
+		return nil, fmt.Errorf("private key in the keystore could not be read (wrong storepass?): %v", err)
 	}
 	signer, ok := key.(crypto.Signer)
 	if !ok {
-		return fmt.Errorf("the keystore holds a %T, which cannot sign an apk", key)
+		return nil, fmt.Errorf("the keystore holds a %T, which cannot sign an apk", key)
 	}
-	k.Signer = signer
-	return nil
+	return signer, nil
+}
+
+// bagAlias reads the friendlyName a SafeBag carries. keytool writes the alias of
+// the entry there, and the subject of the certificate says something else entirely:
+// the debug keystore is androiddebugkey by name and CN=Android Debug by subject, so
+// comparing the subject to the requested alias warned on every build of every user.
+//
+// attrs is the content of the attributes wrapper, a bare concatenation of Attribute
+// SEQUENCEs, and a bag with nothing left to read carries no name.
+func bagAlias(attrs []byte) string {
+	for len(attrs) > 0 {
+		var raw asn1.RawValue
+		rest, err := asn1.Unmarshal(attrs, &raw)
+		if err != nil {
+			return ""
+		}
+		attrs = rest
+
+		var attr struct {
+			OID asn1.ObjectIdentifier
+			Val asn1.RawValue
+		}
+		if _, err := asn1.Unmarshal(raw.FullBytes, &attr); err != nil {
+			continue
+		}
+		if attr.OID.Equal(oidFriendlyNameJDK) || attr.OID.Equal(oidFriendlyNameCSP) {
+			return bagName(attr.Val)
+		}
+	}
+	return ""
+}
+
+// bagName takes the string out of the shape each writer gives it: keytool wraps it
+// in a SET OF, the others write the string itself. 30 is a BMPString, which is what
+// every writer of this attribute uses for a name; anything else is taken as its
+// bytes rather than refused, for a file whose only sin is spelling a name oddly.
+func bagName(val asn1.RawValue) string {
+	body := val
+	if val.Tag == 17 { // a SET OF, whose first element is the name
+		var first asn1.RawValue
+		if _, err := asn1.Unmarshal(val.Bytes, &first); err != nil {
+			return ""
+		}
+		body = first
+	}
+	if body.Tag == 30 {
+		return fromBMPString(body.Bytes)
+	}
+	return string(body.Bytes)
+}
+
+// fromBMPString decodes UTF-16BE with the terminating zero PKCS#12 appends.
+func fromBMPString(b []byte) string {
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		u := binary.BigEndian.Uint16(b[i : i+2])
+		if u == 0 {
+			break
+		}
+		units = append(units, u)
+	}
+	return string(utf16.Decode(units))
 }
 
 // passwordForms are the two ways a PKCS#12 password becomes bytes. RFC 7292 spells
