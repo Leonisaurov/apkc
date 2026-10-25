@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -109,7 +110,9 @@ func TestSetCompilationTypeChange(t *testing.T) {
 func TestLoadTableDropsAStateOfAnotherVersion(t *testing.T) {
 	setupProject(t)
 
-	body := `{"version":3,"type":"apk","digests":{"src/com/myapp/Main.java":"aaaa"},"manifestDigest":"bbbb","bundleSha1":"cccc"}`
+	body := `{"version":` + strconv.Itoa(stateVersion-1) +
+		`,"type":"apk","digests":{"src/com/myapp/Main.java":"aaaa"},"manifestDigest":"bbbb","bundleSha1":"cccc",` +
+		`"classApi":{"demo.Main":"dddd"}}`
 	if err := os.WriteFile(DataFile, []byte(body), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +123,9 @@ func TestLoadTableDropsAStateOfAnotherVersion(t *testing.T) {
 	}
 	if len(DataTable.Digests) != 0 {
 		t.Errorf("records of another version must not be trusted, got %v", DataTable.Digests)
+	}
+	if len(DataTable.ClassAPI) != 0 {
+		t.Errorf("the class shapes of another build are not this build's index, got %v", DataTable.ClassAPI)
 	}
 	if DataTable.ManifestDigest != "" || DataTable.BundleSha1 != "" {
 		t.Error("the digests that gate the link and the signature must go with the records")
@@ -142,7 +148,7 @@ func TestSaveTableCarriesTheVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `"version":4`) {
+	if !strings.Contains(string(b), `"version":`+strconv.Itoa(stateVersion)) {
 		t.Fatalf("the state must name the shape it is, got %s", b)
 	}
 

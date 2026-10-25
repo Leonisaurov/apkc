@@ -54,10 +54,11 @@ func prompt(text string, defaultValue string) string {
 // only shape it trusts. Every time the meaning of a record changed the state had
 // to say so: 1 kept mtimes, 2 added the jar fingerprint and the manifest digest,
 // 3 the bundle entries and the api of the project dex, 4 records every tracked
-// file by content instead of by timestamp. A file from another version is not an
-// error and not a downgrade either: its records are dropped, one round produces
-// everything again, and the next state is whole.
-const stateVersion = 4
+// file by content instead of by timestamp, 5 the shape of each compiled class. A
+// file from another version is not an error and not a downgrade either: its
+// records are dropped, one round produces everything again, and the next state is
+// whole.
+const stateVersion = 5
 
 type Data struct {
 	Version int    `json:"version"`
@@ -98,6 +99,12 @@ type Data struct {
 	// into the new zip as it is, which is what keeps a one line edit from
 	// recompressing a hundred megabytes of assets that did not change.
 	BundleEntries map[string]string `json:"bundleEntries,omitempty"`
+	// ClassAPI maps each compiled class of the project to a digest of the shape it
+	// presented: its members by name and descriptor, what it throws, the value of
+	// its constants. No digest of a source can say whether the code that calls it
+	// still links, because the caller's own file did not change — only what it
+	// promised to the vm did. That question is what this table answers.
+	ClassAPI map[string]string `json:"classApi,omitempty"`
 }
 
 const DataFile = "build/incremental.json"

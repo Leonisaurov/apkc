@@ -174,8 +174,15 @@ func _build(o buildOpts) {
 		}
 	}
 
-	compSource := compileKotlin(o.incremental)
-	compSource = compileJava(o.incremental) || compSource
+	compiledKotlin, compKotlin := compileKotlin(o.incremental)
+	compiledJava, compJava := compileJava(o.incremental)
+	compSource := compKotlin || compJava
+	// javac has no way to notice that what a source calls changed shape: its own
+	// file did not. The compiled classes are the only record of that, and they
+	// exist after this stage, so the callers get their own pass.
+	if closeApiGap(o.incremental, append(append([]string{}, compiledJava...), compiledKotlin...)) {
+		compSource = true
+	}
 	if o.incremental && compSource {
 		saveTable()
 	}
@@ -504,11 +511,14 @@ func kotlinShortcomings(compiler string, jars []string) []string {
 	return missing
 }
 
-func compileKotlin(incremental bool) bool {
+// compileKotlin answers the set the module went in with, which is wider than the
+// files that changed: kotlinc has no per file mode, so every kotlin source of the
+// project is recompiled whenever any of them moved.
+func compileKotlin(incremental bool) ([]string, bool) {
 	defer timeIt("kotlinc")()
 	kotlins, _ := getFiles("src", ".kt", incremental)
 	if len(kotlins) < 1 {
-		return false
+		return nil, false
 	}
 
 	// kotlinc has no per-file incremental mode at the command line: whenever the
@@ -548,7 +558,7 @@ func compileKotlin(incremental bool) bool {
 	if incremental {
 		updateRecords(compiling)
 	}
-	return true
+	return compiling, true
 }
 
 // allJars returns every jar of the project. It is used for classpaths, where
@@ -565,12 +575,16 @@ func classpath(entries []string) string {
 	return strings.Join(entries, string(filepath.ListSeparator))
 }
 
-// compileJava compiles java files in src dir and uses jar files in the jar dir as classpath
-func compileJava(incremental bool) bool {
+// compileJava compiles java files in src dir and uses jar files in the jar dir as
+// classpath. It answers both what it handed to the compiler and whether it ran at
+// all, because the dependency index needs to know which sources this round has
+// already seen: a resource id change sends every source through javac, and the index
+// would send the same files a second time for nothing.
+func compileJava(incremental bool) ([]string, bool) {
 	defer timeIt("javac")()
 	javas, _ := getFiles("src", ".java", incremental)
 	if len(javas) < 1 {
-		return false
+		return nil, false
 	}
 	LogD("Incremental", "javac recompiles", len(javas), "java files")
 	LogI("build", "compiling java files")
@@ -593,7 +607,69 @@ func compileJava(incremental bool) bool {
 	if incremental {
 		updateRecords(javas)
 	}
-	return true
+	return javas, true
+}
+
+// closeApiGap gives javac the input it cannot see: the shape of the classes its
+// sources link against. It runs after the sources whose bytes moved have compiled,
+// reads what those classes now present, and sends every caller of a shape that
+// moved through the compiler again.
+//
+// A shape that did not move costs nothing, and the first build after a wiped state
+// only records the index: every source went through the compiler that round anyway,
+// so there is no caller left to chase. compiled is what this round already handed
+// over — a new resource id sends every source through javac, and answering that with
+// a second pass over the same files would be the index costing a whole compile.
+func closeApiGap(incremental bool, compiled []string) bool {
+	if !incremental {
+		return false
+	}
+
+	classes, unread := classIndex(filepath.Join("build", "classes"))
+	if len(unread) > 0 {
+		LogD("Incremental", "the shape of", len(unread), "class files could not be read, and they name nothing")
+	}
+	recorded := DataTable.ClassAPI
+	DataTable.ClassAPI = apiDigests(classes)
+	if len(recorded) == 0 {
+		return false
+	}
+
+	callers := withoutSources(staleCallers(classes, recorded), compiled)
+	if len(callers) == 0 {
+		return false
+	}
+
+	LogI("build", "recompiling the callers of a class that changed shape")
+	LogD("Incremental", len(callers), "sources call a class whose shape moved")
+	markAsChanged(callers)
+
+	// each compiler takes exactly the callers of its own language: the records of
+	// every source listed above were dropped, and the trees they walk only report
+	// what has no record
+	ran := false
+	if _, ranKotlin := compileKotlin(true); ranKotlin {
+		ran = true
+	}
+	if _, ranJava := compileJava(true); ranJava {
+		ran = true
+	}
+	return ran
+}
+
+// withoutSources drops the paths a round has already compiled.
+func withoutSources(paths []string, compiled []string) []string {
+	done := make(map[string]bool, len(compiled))
+	for _, path := range compiled {
+		done[path] = true
+	}
+	out := []string{}
+	for _, path := range paths {
+		if !done[path] {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // d8Args are the flags every d8 invocation needs, shared by the per jar cache

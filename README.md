@@ -145,9 +145,15 @@ When one of those tools exits 0 its output was discarded. That is exactly the ho
 
 A project with `.kt` files needs two things the Android SDK does not ship: the compiler on `PATH`, and a `kotlin-stdlib*.jar` in `jar/`, because `android.jar` carries no `kotlin.*`. The build names whichever is missing instead of dying with an empty error or a wall of unresolved references.
 
-### What is still not tracked: who calls whom
+### Who calls whom is decided by the compiled classes
 
-Changing the signature of a method in one file does **not** recompile the callers. `javac` is handed only the files whose content moved, and it trusts a `.class` newer than its source, so the build stays green and the apk carries a caller linked against a descriptor that no longer exists: `NoSuchMethodError` on the device. `-sourcepath` was tried and does not help, because javac only pulls in a source when the `.java` is newer than its `.class` — which a timestamp decision cannot answer either. Closing this needs a real dependency graph: which project class references which, read from the constant pool of the compiled classes, so a changed class invalidates the sources that name it. Until then, an API change is a reason to run `apkc build` without `--inc`.
+Changing the signature of a method in one file used to leave its callers alone: `javac` is handed only the files whose content moved and trusts a `.class` newer than its source, so the build stayed green while the apk carried a caller linked against a descriptor nobody had — `NoSuchMethodError` on the device. `-sourcepath` does not help, because javac pulls a source in only when the `.java` is newer than its `.class`, which is the same timestamp question in a different dress.
+
+What answers it is the compiled classes themselves. After the sources that moved have compiled, apkc reads every `.class` of the project: the constant pool names the classes each one uses, and the fields and methods describe the shape a caller links against — name, descriptor, visibility, generic signature, declared exceptions and the value of a `static final` constant, which `javac` copies into the caller's own bytes. The digest of that shape is kept in the state. A shape that moved sends every class that names it back through `javac`, closed over the graph so a caller of a caller goes too, and a class that vanished from `build/classes` is treated as the loudest shape change there is.
+
+Measured on a demo where only `Foo` is ever edited and `Bar` calls it: with `Foo.bar(int)` becoming `Foo.bar(long)`, the previous apkc left `Bar` calling `demo/Foo.bar:(I)` — proved by `javap` on the class the apk was built from — and this one recompiles it and packages `bar:(J)`. The same round with a *body* edit chases nobody and pays `javac` once. Moving a `static final int LIMIT` from 5 to 6 sends `Bar` back too, and `javap` shows the new value inlined where the old one sat.
+
+The cost is one extra `javac` per round in which a shape actually moved — measured at 3.1 s in a two class demo, where the first pass costs 3.3 s — and nothing at all in a round that moved none, because the index is only read once something compiled. Two limits are real rather than tidied away. A project with `.kt` sources has no per file answer from the Kotlin command line, so when a caller of a moved shape turns out to be kotlin, the module goes in. And the index covers the project's own classes: the members of a jar are not indexed, which is sound for the same reason the dex is — the bytes of `jar/` are an input of the merge, so a dependency that changed shape changed its digest. A caller whose callee was **deleted** is a case the index cannot answer either, because the deleted class is no longer in `build/classes` to be read: what catches that today is the prune step, which drops the orphan class and recompiles the remaining sources, so the round costs a whole `javac` and stays correct. A callee *renamed* keeps the old class file's shape on record and is answered by the index.
 
 ### The package can be aligned and signed without a JVM
 
@@ -163,7 +169,7 @@ What the Go packager does not do: JAR signing (v1). The v2 scheme is checked fro
 
 ### One state file, written once, and atomically
 
-`build/incremental.json` tracks 410 files on the demo project, and nine places in the code used to save it, each one rewriting the whole JSON. It is written once, at the end of an incremental build, through `build/incremental.json.tmp` and a rename, so a build that dies cannot leave a half written state file behind. Two checkpoints stay: right after the resource stage and right after the compilers, because a build that aborts later (a duplicated class, a failing `d8`) has already produced classes that the next cycle must know about, or the tree keeps an orphan `.class` that no later run can prune. An idle cycle writes the file zero times.
+`build/incremental.json` tracks 410 files on the demo project, and nine places in the code used to save it, each one rewriting the whole JSON. It is written once, at the end of an incremental build, through `build/incremental.json.tmp` and a rename, so a build that dies cannot leave a half written state file behind. Two checkpoints stay: right after the resource stage and right after the compilers, because a build that aborts later (a duplicated class, a failing `d8`) has already produced classes that the next cycle must know about, or the tree keeps an orphan `.class` that no later run can prune. An idle cycle writes the file zero times. It carries one digest per class of the project besides the digests of the files, and that is the only part of the state which describes something the build compiled rather than something it read.
 
 ### A project with no sources is idle
 
@@ -189,6 +195,7 @@ One signing option was tried and reverted: `--align-file-size=false` avoids padd
 |---|---|---|
 | nothing (idle) | ~2s | **~0.1s inside apkc**, apk untouched, state file not rewritten |
 | one source file | 3m56s | **18.5s** (javac 5.9s, `d8` app 8.0s, package 0.1s, apksigner 3.9s) — no bucket re-dexed |
+| a method signature moved, its caller untouched | **the caller shipped the descriptor nobody had** | one extra `javac` pass for the caller and a dex carrying the new one |
 | the same file touched, bytes unchanged | 3m56s | **idle**: no compile, no package, apk left exactly as it was |
 | a resource whose ids did not change | 3m56s | **5.5s** |
 | every jar rewritten with the same bytes | 59s | **under 1s** |
@@ -206,7 +213,7 @@ These are one device heating up, so the same cycle measured 18.5s and 28.3s on t
 
 The last two rows are the ones that matter: an incremental build that answers fast and ships the wrong bytes is worse than a slow one. Every stage decides by content now — the sources, the resources, the java `aapt` generates, `jar/`, the manifest, `lib/` and `assets/` — with a sha1 of those bytes, so a timestamp can neither force work that is not needed nor hide work that is. What still costs a full pass does so on purpose: a new resource id invalidates every source (`javac` inlines `R.*` into the class files), and a `minSdkVersion` change invalidates every compiled constant at the new api level, the dependency buckets included. A manifest edit that changes neither pays only the link and the signature.
 
-Building the six buckets the first time costs 4m38s; `apkc clean` deletes them with `build/`. The first run after upgrading is one full rebuild, because the old state file has neither `dexInputs` nor `manifestDigest` yet and the per-jar cache of the previous layout is not a bucket.
+Building the six buckets the first time costs 4m38s; `apkc clean` deletes them with `build/`. The first run after upgrading is one full rebuild: the state names the shape of records it holds (`stateVersion`, and a file from another version keeps nothing but the build type), and the class digests of the dependency index cannot exist in a file written before it.
 
 What is left when a source changes is `d8` on the project plus the package and the signature, ~18.5s measured. It does not get cheaper by pre-merging the six bucket dexes into one file: measured before, merging 49 separate dex files plus the app classes took 53s, pre-merging the 49 into a single dex took 36s once and then 40s to merge that one with the app classes. The cost is in producing the multi-MB output dex, not in the number of inputs.
 
