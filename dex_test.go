@@ -272,11 +272,11 @@ func TestPruneDepsCacheKeepsTheNewestSets(t *testing.T) {
 // killer, so the number is never allowed to come from the core count alone.
 func TestDepWorkersNeverStartsMoreJVMsThanTheBuildCanAfford(t *testing.T) {
 	t.Setenv("APKC_JOBS", "")
-	if got := depWorkers(0); got != 1 {
+	if got := depWorkers(0, 0); got != 1 {
 		t.Errorf("a build with no bucket still has to be able to dex one: %d", got)
 	}
 	for _, buckets := range []int{1, 2, 6, 40} {
-		got := depWorkers(buckets)
+		got := depWorkers(buckets, 0)
 		if got < 1 {
 			t.Errorf("%d buckets answered %d workers", buckets, got)
 		}
@@ -289,19 +289,51 @@ func TestDepWorkersNeverStartsMoreJVMsThanTheBuildCanAfford(t *testing.T) {
 	}
 
 	t.Setenv("APKC_JOBS", "2")
-	if got := depWorkers(6); got != 2 {
+	if got := depWorkers(6, 0); got != 2 {
 		t.Errorf("APKC_JOBS is the way out of a machine that cannot take four: want 2, got %d", got)
 	}
-	if got := depWorkers(1); got != 1 {
+	if got := depWorkers(1, 0); got != 1 {
 		t.Errorf("an override does not invent workers: want 1, got %d", got)
 	}
 	t.Setenv("APKC_JOBS", "99")
-	if got := depWorkers(3); got != 3 {
+	if got := depWorkers(3, 0); got != 3 {
 		t.Errorf("an override above the bucket count is the bucket count: want 3, got %d", got)
 	}
 	t.Setenv("APKC_JOBS", "not a number")
-	if got := depWorkers(3); got < 1 || got > depsWorkersMax {
+	if got := depWorkers(3, 0); got < 1 || got > depsWorkersMax {
 		t.Errorf("a garbage override has to fall back to the memory rule, got %d", got)
+	}
+}
+
+// TestDepWorkersCostIsTheProjectsNotTheTools is the reason the budget is not a constant:
+// the two shapes this device was measured over need a different answer from the same
+// machine. A bucket of toy jars sits at 86 MB of tree, a bucket of androidx at ~390 MB,
+// and one JVM of the latter was seen holding 750 MB alone.
+func TestDepWorkersCostIsTheProjectsNotTheTools(t *testing.T) {
+	t.Setenv("APKC_JOBS", "")
+	// the sixty synthetic jar demo: six buckets of a few KB, on a device with room
+	if got := depWorkersIn(6, 6400, 0); got != depsWorkersMax {
+		t.Errorf("toy jars on a roomy device want the ceiling, got %d", got)
+	}
+	// FirebaseTest on the same device: 1.6 MB per bucket on average, and the model
+	// still says four because 6.4 GB covers four of them
+	if got := depWorkersIn(6, 6400, 2); got != depsWorkersMax {
+		t.Errorf("the measured firebase set has room for the ceiling, got %d", got)
+	}
+	// the same firebase set on a phone with 1.5 GB left: a worker costs 120 + 200*2 MB,
+	// so two of them fit and the third is the out of memory killer's answer. The rule
+	// is measured: two concurrent d8 over this set were seen at 1.24 GB of tree
+	if got := depWorkersIn(6, 1500, 2); got != 2 {
+		t.Errorf("want two workers over 1.5 GB with 2 MB buckets, got %d", got)
+	}
+	// and a set of jars five times bigger does not fit two at all: one JVM of that
+	// shape was measured holding 750 MB on its own
+	if got := depWorkersIn(6, 700, 10); got != 1 {
+		t.Errorf("want one worker when a bucket weighs 10 MB, got %d", got)
+	}
+	// a machine reporting nothing (no /proc/meminfo) is not a machine with zero memory
+	if got := depWorkersIn(6, 0, 5); got != depsWorkersMax {
+		t.Errorf("an unknown memory must not stop the pool, got %d", got)
 	}
 }
 

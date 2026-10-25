@@ -27,6 +27,17 @@ const depsBucketsMax = 6
 // has room for three.
 const depsWorkersMax = 4
 
+// The two numbers a d8 costs memory with, measured on this device over the same round:
+// a bucket of toy jars (a few KB each) sat at 86 MB of tree per worker, a bucket of
+// androidx and firebase (1.6 MB on average, 4.1 MB at most) at 390 MB, and the largest
+// single one of those JVMs was seen holding 750 MB on its own. So the cost is a JVM that
+// desugars at all, plus a heap that grows with the code it is handed: a flat number per
+// worker is off by a factor of nine exactly where it matters.
+const (
+	depsWorkerBaseMB   = 120
+	depsWorkerPerJarMB = 200
+)
+
 // depsCacheKeep counts bucket directories, not whole sets, because the cache now holds
 // jar/ split into buckets. It has to stay above depsBucketsMax so the buckets of the
 // roster in use are never the oldest thing in the cache: dexBucket refreshes the mtime
@@ -907,7 +918,17 @@ func dexDeps(api int, coreLibrary bool, jars []string, digests []string) ([]stri
 	// lock; what is kept in bucket order is the result, the d8 report and the failure,
 	// because a classpath whose dexes come in the order the JVMs finished is not the
 	// same build twice.
-	workerCount := depWorkers(buckets)
+	// what one bucket of this project weighs decides how many of them fit: the bytes of
+	// jar/ are already in the page cache from hashing them for the digests, so this is
+	// a stat per jar and not a read.
+	var jarTotal int64
+	for _, jar := range uniqueJars {
+		if info, err := os.Stat(jar); err == nil {
+			jarTotal += info.Size()
+		}
+	}
+	meanBucketMB := jarTotal / int64(buckets) / (1 << 20)
+	workerCount := depWorkers(buckets, meanBucketMB)
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	for w := 0; w < workerCount; w++ {
@@ -941,6 +962,11 @@ func dexDeps(api int, coreLibrary bool, jars []string, digests []string) ([]stri
 	// still writing their directories is how a cache entry gets deleted the second
 	// after it was produced
 	if produced {
+		// the answer of the budget belongs in the log beside the time it cost: a round
+		// that took twice as long as the last one was run by a different number of
+		// workers, and without this the only way to know is to read /proc while
+		// building
+		LogD("build", "dexed", len(uniqueJars), "jars in", buckets, "buckets,", workerCount, "of them at a time")
 		pruneDepsCache()
 	}
 	return dexes, produced
@@ -973,13 +999,21 @@ func runBucket(api int, coreLibrary bool, jars, digests, allJars []string) bucke
 	return bucketResult{dexes: dexes, ran: ran, out: out}
 }
 
-// depWorkers is how many buckets may dex at once. The ceiling is memory, not cores:
-// one bucket of the sixty jar demo peaks at about 90 MB of java plus its own d8 boot
-// overhead, and this device has been measured answering the cache with a fraction of
-// what it holds, so a worker that pushes the phone into its out of memory killer costs
-// the whole build rather than the few seconds it saved. Four is where the buckets stop
-// fitting inside a second of each other anyway.
-func depWorkers(buckets int) int {
+// depWorkers is how many buckets may dex at once. The ceiling is memory, not cores, and
+// how much memory is a property of the project rather than of the tool: the same four
+// workers that cost 350 MB over toy jars ask for 1.5 GB over androidx and firebase. A
+// worker that pushes the phone into its out of memory killer costs the whole build
+// rather than the few seconds it saved, and four is where the buckets stop gaining over
+// the one before anyway.
+//
+// jarMB is what one bucket of this project weighs in megabytes.
+func depWorkers(buckets int, jarMB int64) int {
+	return depWorkersIn(buckets, memAvailableMB(), jarMB)
+}
+
+// depWorkersIn is the model on its own, with the memory handed in, so the two measured
+// projects can be asserted without waiting for this device to have less of it.
+func depWorkersIn(buckets, freeMB int, jarMB int64) int {
 	if buckets < 1 {
 		return 1
 	}
@@ -990,9 +1024,9 @@ func depWorkers(buckets int) int {
 		}
 		return limit
 	}
-	if free := memAvailableMB(); free > 0 {
-		// a slice per worker with room for the rest of the build running beside it
-		if byMem := free / 400; byMem < limit {
+	perWorker := depsWorkerBaseMB + int(jarMB)*depsWorkerPerJarMB
+	if freeMB > 0 && perWorker > 0 {
+		if byMem := freeMB / perWorker; byMem < limit {
 			limit = byMem
 		}
 	}
