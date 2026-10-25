@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,13 @@ import (
 // its own, so more than a handful start costing their own start up, and an add only
 // needs them small enough that one changed jar moves a fraction of the whole.
 const depsBucketsMax = 6
+
+// depsWorkersMax caps how many of those buckets dex at the same time. Each one is a JVM
+// and this device has been seen killing the build for a second JVM that did not fit:
+// four is where the measured buckets stop gaining over the one before, and the ceiling
+// is what keeps a project with more buckets from starting five of them on a phone that
+// has room for three.
+const depsWorkersMax = 4
 
 // depsCacheKeep counts bucket directories, not whole sets, because the cache now holds
 // jar/ split into buckets. It has to stay above depsBucketsMax so the buckets of the
@@ -175,6 +183,31 @@ func _build(o buildOpts) {
 		bundleRes(o.useAAB, o.incremental)
 	}
 
+	// what the dependencies contribute to the dex is decided by their bytes, not by
+	// their timestamps: hashing jar/ costs a tenth of a second for 60 jars, and a
+	// timestamp cannot tell a sync that rewrote a jar from a new dependency.
+	//
+	// That dexing then runs while the project compiles. A cold set is ten seconds of d8
+	// and javac would otherwise sit through all of it, and nothing the compilers do is
+	// an input of it: jar/ is read, build/classes is not written by any bucket. The
+	// answer is picked up below, where a dex is actually needed, so the stages keep
+	// their order even though they do not keep their clock. One thing does move: the
+	// worker budget reads the memory the compilers have left rather than the whole
+	// device's, which is the answer it should have been giving all along.
+	jars := allJars()
+	digests := jarDigests(jars)
+	fingerprint := jarsFingerprint(api, digests)
+	// below API 21 the runtime cannot open a second dex file, so there the jars stay
+	// inputs of one merge over everything and every edit pays for all of them
+	splitDeps := api >= 21
+	depAnswer := make(chan depResult, 1)
+	if splitDeps {
+		go func() {
+			dexes, stale := dexDeps(api, o.coreLibrary, jars, digests)
+			depAnswer <- depResult{dexes: dexes, stale: stale}
+		}()
+	}
+
 	compiledKotlin, compKotlin := compileKotlin(o.incremental)
 	compiledJava, compJava := compileJava(o.incremental)
 	compSource := compKotlin || compJava
@@ -195,25 +228,18 @@ func _build(o buildOpts) {
 	// writing one, so counting it as missing would rebuild, realign and resign the apk
 	// on every run of an empty project
 	dexMissing := !exists(filepath.Join("build", "classes.dex")) && len(classes) > 0
-	// what the dependencies contribute to the dex is decided by their bytes, not
-	// by their timestamps: hashing jar/ costs a tenth of a second for 60 jars,
-	// and a timestamp cannot tell a sync that rewrote a jar from a new dependency
-	jars := allJars()
-	digests := jarDigests(jars)
-	fingerprint := jarsFingerprint(api, digests)
-	// below API 21 the runtime cannot open a second dex file, so there the jars stay
-	// inputs of one merge over everything and every edit pays for all of them
-	splitDeps := api >= 21
 	depDexes := []string{}
 	depStale := false
 	if splitDeps {
 		// the merge was the only thing that caught a class the project and a
 		// dependency both define: handed two dex files the runtime picks one of
-		// them and no build log ever mentions it
+		// them and no build log ever mentions it. It compares against build/classes,
+		// so it waits for the compilers, as it always did.
 		if class, jar, dup := shadowedClass(jars); dup {
 			LogF("build", "Type "+class+" is defined multiple times", "the project and "+jar+" both hold it")
 		}
-		depDexes, depStale = dexDeps(api, o.coreLibrary, jars, digests)
+		answer := <-depAnswer
+		depDexes, depStale = answer.dexes, answer.stale
 	}
 	// two different decisions that used to be one flag: whether the bundle has to take
 	// the dexes of a changed dependency set, and whether the classes of the project
@@ -837,9 +863,11 @@ func auxRoster(libStored bool) (string, map[string]string) {
 // it is also what an add or a remove would have to pay again in full: sixty jars took
 // 224,8s pinned to three cpus. Splitting the set by the name of each jar keeps the
 // buckets stable while the rest of jar/ changes, so adding a dependency re-dexes one
-// bucket and not the lot. The cache holds several files per bucket because d8 splits
-// by itself above the 64K method limit. It reports whether it had to run d8 for any
-// bucket, which is when the dependencies really changed on disk.
+// bucket and not the lot, and the buckets that do have to run go to a pool of workers
+// bounded by the memory of this device rather than one after another. The cache holds
+// several files per bucket because d8 splits by itself above the 64K method limit. It
+// reports whether it had to run d8 for any bucket, which is when the dependencies
+// really changed on disk.
 func dexDeps(api int, coreLibrary bool, jars []string, digests []string) ([]string, bool) {
 	// the whole dependency pass, so an idle build that answered every bucket from the
 	// cache stays under the threshold of timeIt and never logs
@@ -860,28 +888,153 @@ func dexDeps(api int, coreLibrary bool, jars []string, digests []string) ([]stri
 	}
 
 	buckets := depBuckets(len(uniqueJars))
+	results := make([]bucketResult, buckets)
+	// which jar belongs to which bucket is decided once, here and in order: bucketOf is
+	// a function of the name only, so a worker gets a slice to read and nothing to
+	// fight another worker over.
+	members := make([][]string, buckets)
+	memberDigests := make([][]string, buckets)
+	for i, jar := range uniqueJars {
+		bucket := bucketOf(jar, buckets)
+		members[bucket] = append(members[bucket], jar)
+		memberDigests[bucket] = append(memberDigests[bucket], uniqueDigests[i])
+	}
+
+	// one bucket's d8 costs seconds and six of them in a row cost a build: the split
+	// into buckets exists so an add pays one of them, and the same split is what lets
+	// a cold set or a regenerated jar/ run its buckets at the same time. Each worker
+	// writes only its own slot and its own cache directory, so there is nothing to
+	// lock; what is kept in bucket order is the result, the d8 report and the failure,
+	// because a classpath whose dexes come in the order the JVMs finished is not the
+	// same build twice.
+	workerCount := depWorkers(buckets)
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for bucket := range jobs {
+				results[bucket] = runBucket(api, coreLibrary, members[bucket], memberDigests[bucket], uniqueJars)
+			}
+		}()
+	}
+	for bucket := 0; bucket < buckets; bucket++ {
+		jobs <- bucket
+	}
+	close(jobs)
+	wg.Wait()
+
 	dexes := []string{}
 	produced := false
-	for bucket := 0; bucket < buckets; bucket++ {
-		memberJars := []string{}
-		memberDigests := []string{}
-		for i, jar := range uniqueJars {
-			if bucketOf(jar, buckets) == bucket {
-				memberJars = append(memberJars, jar)
-				memberDigests = append(memberDigests, uniqueDigests[i])
-			}
+	for bucket, result := range results {
+		if result.err != nil {
+			LogF("build", "the d8 of dependency bucket", bucket, "failed:", string(result.out), result.err.Error())
 		}
-		wrote, ran := dexBucket(api, coreLibrary, memberJars, memberDigests, uniqueJars)
-		dexes = append(dexes, wrote...)
-		produced = produced || ran
+		if result.ran {
+			reportD8Drops(result.out)
+		}
+		dexes = append(dexes, result.dexes...)
+		produced = produced || result.ran
+	}
+	// once for the whole stage, not inside a bucket: pruning while other buckets are
+	// still writing their directories is how a cache entry gets deleted the second
+	// after it was produced
+	if produced {
+		pruneDepsCache()
 	}
 	return dexes, produced
 }
 
-// depBuckets is how many dex sets jar/ is split into: one call per bucket costs a d8
-// start up, so a small set stays one call and a large one pays for the parallel
-// savings of an add. Ten jars per bucket keeps the six buckets of a sixty jar project
-// at about a sixth of the whole set each.
+// depResult is what the dependency dexing contributes, handed back over the channel
+// that joins it to the build after the compilers ran.
+type depResult struct {
+	dexes []string
+	stale bool
+}
+
+// bucketResult is what one bucket contributes, kept apart so the parent can report and
+// fail in bucket order.
+type bucketResult struct {
+	dexes []string
+	ran   bool
+	out   []byte
+	err   error
+}
+
+// runBucket is the worker's body: dexBucket's answer plus the reason it failed, with no
+// exit in it. A worker that called LogF would take the process down while the rest of
+// the build was still writing, and the parent reports the failure naming the bucket.
+func runBucket(api int, coreLibrary bool, jars, digests, allJars []string) bucketResult {
+	dexes, ran, out, err := dexBucket(api, coreLibrary, jars, digests, allJars)
+	if err != nil {
+		return bucketResult{err: err, out: out}
+	}
+	return bucketResult{dexes: dexes, ran: ran, out: out}
+}
+
+// depWorkers is how many buckets may dex at once. The ceiling is memory, not cores:
+// one bucket of the sixty jar demo peaks at about 90 MB of java plus its own d8 boot
+// overhead, and this device has been measured answering the cache with a fraction of
+// what it holds, so a worker that pushes the phone into its out of memory killer costs
+// the whole build rather than the few seconds it saved. Four is where the buckets stop
+// fitting inside a second of each other anyway.
+func depWorkers(buckets int) int {
+	if buckets < 1 {
+		return 1
+	}
+	limit := buckets
+	if forced, err := strconv.Atoi(os.Getenv("APKC_JOBS")); err == nil && forced > 0 {
+		if forced < limit {
+			limit = forced
+		}
+		return limit
+	}
+	if free := memAvailableMB(); free > 0 {
+		// a slice per worker with room for the rest of the build running beside it
+		if byMem := free / 400; byMem < limit {
+			limit = byMem
+		}
+	}
+	if limit > depsWorkersMax {
+		limit = depsWorkersMax
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
+// memAvailableMB reads the kernel's own answer to "how much is free", which counts what
+// can be reclaimed from cache; the number /proc/meminfo calls free is the one that
+// makes a device with a warm page cache look out of memory.
+func memAvailableMB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return 0
+		}
+		return kb / 1024
+	}
+	return 0
+}
+
+// depBuckets is how many dex sets jar/ is split into. Each one is a d8 of its own, so
+// a small set stays a single call and does not pay six start ups for nothing; a large
+// one is split because that is what lets an add re-dex a sixth of the set and what
+// lets a cold set run its buckets at the same time. Ten jars per bucket keeps the six
+// buckets of a sixty jar project at about a sixth of the whole set each.
 func depBuckets(jars int) int {
 	buckets := (jars + 9) / 10
 	if buckets > depsBucketsMax {
@@ -909,16 +1062,20 @@ func bucketOf(jar string, buckets int) int {
 }
 
 // dexBucket dexes one bucket of jar/ into a directory named by its content and returns
-// the dex files there, whether they were just written or found in the cache. A bucket
-// the cache already answers contributes its dexes and reports false: the difference
-// between an add that re-dexes one bucket and one that re-dexes the whole set is
-// exactly that bool. A bucket whose jars hold no class is remembered by a marker so
-// d8 is not handed them again to produce nothing. allJars is every jar of the set, of
-// which the ones that are not in this bucket become the classpath: a class desugaring
-// against a type another bucket holds would otherwise be dropped by d8.
-func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJars []string) ([]string, bool) {
+// the dex files there, whether they were just written or found in the cache, the output
+// d8 produced and the reason it failed. A bucket the cache already answers contributes
+// its dexes and reports false: the difference between an add that re-dexes one bucket
+// and one that re-dexes the whole set is exactly that bool. A bucket whose jars hold no
+// class is remembered by a marker so d8 is not handed them again to produce nothing.
+// allJars is every jar of the set, of which the ones that are not in this bucket become
+// the classpath: a class desugaring against a type another bucket holds would otherwise
+// be dropped by d8.
+//
+// It fails by returning: the buckets run as workers, and an exit from inside one of
+// them would take the process down while another is still writing its own directory.
+func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJars []string) ([]string, bool, []byte, error) {
 	if len(jars) < 1 {
-		return nil, false
+		return nil, false, nil, nil
 	}
 	// the cache key is the api level and the bytes of this bucket only: re-dexing a
 	// bucket because an unrelated bucket changed is exactly the whole-set cost the
@@ -926,6 +1083,13 @@ func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJa
 	// later changes shape is not recomputed here; that is the price of the split and
 	// is called out in the README.
 	dir := filepath.Join("build", "dexcache", "deps-"+sha1Text(strconv.Itoa(api)+"\n"+strings.Join(digests, "\n")))
+	// d8 writes here and the finished bucket is moved under the name above in one
+	// rename: a build that dies with d8 still running would otherwise leave a directory
+	// whose name is the digest of exactly those inputs, and the next one would read half
+	// a bucket as a cache hit and ship it. The pid is part of the name because the
+	// process that died is not the one cleaning up: a build killed by the out of memory
+	// killer leaves its staging behind, and the next build must not dex into it.
+	staging := filepath.Join("build", "dexcache", "writing-"+strconv.Itoa(os.Getpid())+"-"+filepath.Base(dir))
 	// a bucket that the cache answers costs milliseconds and a bucket that has to go
 	// through d8 costs up to a minute and a half, so the stage name carries the
 	// directory: without it the log says only that the build was slow
@@ -937,10 +1101,13 @@ func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJa
 		if err := os.Chtimes(dir, now, now); err != nil {
 			LogW("build", "could not refresh", dir, err.Error())
 		}
-		return dexFilesIn(dir), false
+		return dexFilesIn(dir), false, nil, nil
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		LogF("build", err, dir)
+	if err := os.RemoveAll(staging); err != nil {
+		return nil, false, nil, err
+	}
+	if err := os.MkdirAll(staging, 0755); err != nil {
+		return nil, false, nil, err
 	}
 
 	skip := map[string]bool{}
@@ -950,7 +1117,7 @@ func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJa
 	LogI("build", "dexing dependencies")
 	args := d8Args(api, coreLibrary)
 	args = append(args, classpathArgs(skip, allJars)...)
-	args = append(args, "--output", dir)
+	args = append(args, "--output", staging)
 	args = append(args, jars...)
 	cmd := exec.Command(d8Path, args...)
 	out, err := cmd.CombinedOutput()
@@ -958,17 +1125,28 @@ func dexBucket(api int, coreLibrary bool, jars []string, digests []string, allJa
 		// d8 still aborts on a class two jars of the same bucket both define, which
 		// is the merge's guarantee surviving inside a bucket; across buckets the
 		// shadowedClass guard only covers the project, not a jar shadowing another
-		LogF("build", string(out), d8Path, args)
+		if rmErr := os.RemoveAll(staging); rmErr != nil {
+			LogW("build", "could not discard", staging, rmErr.Error())
+		}
+		return nil, false, out, err
 	}
-	reportD8Drops(out)
+	// the two buckets are the same bytes, so a directory that got there first is kept
+	// rather than treated as a conflict: a second apkc over the same project is dexing
+	// the same inputs at the same time, not corrupting this one
+	published := os.Rename(staging, dir)
+	if err := os.RemoveAll(staging); err != nil {
+		LogW("build", "could not discard", staging, err.Error())
+	}
+	if published != nil && !exists(dir) {
+		return nil, true, out, published
+	}
 	dexes := dexFilesIn(dir)
 	if len(dexes) == 0 {
 		if err := os.WriteFile(dir+".nodex", nil, 0644); err != nil {
-			LogF("build", err, dir)
+			return nil, true, out, err
 		}
 	}
-	pruneDepsCache()
-	return dexes, true
+	return dexes, true, out, nil
 }
 
 // dexFilesIn lists the dex files of a d8 output dir, ordered by their index: d8
@@ -1063,6 +1241,13 @@ func jarClasses(jar string) ([]string, error) {
 	return names, nil
 }
 
+// depsStagingTTL is how long a bucket left half written by a build that died counts as
+// still in use. A d8 of one bucket was measured at six seconds here and the worst bucket
+// of a heavy set is the one that decides, so an hour is a margin nobody has to think
+// about twice; the price of guessing low is a second apkc losing the directory the first
+// is still dexing into.
+const depsStagingTTL = time.Hour
+
 // pruneDepsCache drops the oldest dexed dependency buckets. The cache now holds jar/
 // split into buckets keyed by their content, so it grows with every bucket version ever
 // tried, while the newest few are what an add and a remove back and forth needs to skip
@@ -1078,7 +1263,14 @@ func pruneDepsCache() {
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "deps-") {
 			// the per jar dexes of the layout this replaced: one file per
-			// dependency, nobody reads them any more and they are megabytes
+			// dependency, nobody reads them any more and they are megabytes.
+			// A staging directory of a build still running answers to the same
+			// name, so it goes only once nothing could be writing it any more.
+			// Ours is not here: dexBucket deletes it before d8 starts.
+			info, err := entry.Info()
+			if err == nil && strings.HasPrefix(entry.Name(), "writing-") && time.Since(info.ModTime()) < depsStagingTTL {
+				continue
+			}
 			if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
 				LogW("build", "could not prune", entry.Name(), err.Error())
 			}

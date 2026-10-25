@@ -216,9 +216,30 @@ func TestPruneDepsCacheKeepsTheNewestSets(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(cache, "abcdef.dex"))
 	writeFile(t, filepath.Join(cache, "abcdef.tmp", "classes.dex"))
+	// a bucket being dexed right now is the same kind of name as a leftover, and the
+	// only difference is age: a build that died an hour ago is garbage, one that
+	// started a second ago belongs to the other apkc over this project
+	if err := os.MkdirAll(filepath.Join(cache, "writing-999-deps-live"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cache, "writing-999-deps-live", "classes.dex"))
+	if err := os.MkdirAll(filepath.Join(cache, "writing-998-deps-dead"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(cache, "writing-998-deps-dead", "classes.dex"))
+	stale := time.Now().Add(-2 * depsStagingTTL)
+	if err := os.Chtimes(filepath.Join(cache, "writing-998-deps-dead"), stale, stale); err != nil {
+		t.Fatal(err)
+	}
 
 	pruneDepsCache()
 
+	if !exists(filepath.Join(cache, "writing-999-deps-live")) {
+		t.Fatal("a directory another build could still be dexing into was taken away from it")
+	}
+	if exists(filepath.Join(cache, "writing-998-deps-dead")) {
+		t.Fatal("a staging directory older than anything could still be writing survives forever")
+	}
 	if exists(filepath.Join(cache, "abcdef.dex")) || exists(filepath.Join(cache, "abcdef.tmp")) {
 		t.Fatal("the dexes of the per jar layout are not read by anybody and have to go")
 	}
@@ -242,5 +263,81 @@ func TestPruneDepsCacheKeepsTheNewestSets(t *testing.T) {
 	}
 	if !exists(filepath.Join(cache, "deps-set"+string(rune('a'+depsCacheKeep+1)))) {
 		t.Fatal("the newest set was pruned, it is the one the build just wrote")
+	}
+}
+
+// TestDepWorkersNeverStartsMoreJVMsThanTheBuildCanAfford pins the three bounds of the
+// pool: one worker per bucket at most, the hard ceiling, and the operator's override.
+// A worker that does not fit in memory costs the whole build to the out of memory
+// killer, so the number is never allowed to come from the core count alone.
+func TestDepWorkersNeverStartsMoreJVMsThanTheBuildCanAfford(t *testing.T) {
+	t.Setenv("APKC_JOBS", "")
+	if got := depWorkers(0); got != 1 {
+		t.Errorf("a build with no bucket still has to be able to dex one: %d", got)
+	}
+	for _, buckets := range []int{1, 2, 6, 40} {
+		got := depWorkers(buckets)
+		if got < 1 {
+			t.Errorf("%d buckets answered %d workers", buckets, got)
+		}
+		if got > buckets {
+			t.Errorf("%d buckets answered %d workers, more than there is work for", buckets, got)
+		}
+		if got > depsWorkersMax {
+			t.Errorf("%d buckets answered %d workers, over the ceiling of %d", buckets, got, depsWorkersMax)
+		}
+	}
+
+	t.Setenv("APKC_JOBS", "2")
+	if got := depWorkers(6); got != 2 {
+		t.Errorf("APKC_JOBS is the way out of a machine that cannot take four: want 2, got %d", got)
+	}
+	if got := depWorkers(1); got != 1 {
+		t.Errorf("an override does not invent workers: want 1, got %d", got)
+	}
+	t.Setenv("APKC_JOBS", "99")
+	if got := depWorkers(3); got != 3 {
+		t.Errorf("an override above the bucket count is the bucket count: want 3, got %d", got)
+	}
+	t.Setenv("APKC_JOBS", "not a number")
+	if got := depWorkers(3); got < 1 || got > depsWorkersMax {
+		t.Errorf("a garbage override has to fall back to the memory rule, got %d", got)
+	}
+}
+
+// TestBucketOfKeepsJarsWhereTheyAlreadyAre is the property the whole cache of buckets
+// is worth: an add re-dexes one bucket only because the jars that were already there
+// did not move. Nothing but the count of buckets can move them, and that count comes
+// from thresholds rather than from the size of the set.
+func TestBucketOfKeepsJarsWhereTheyAlreadyAre(t *testing.T) {
+	jars := []string{"jar/a.jar", "jar/b.jar", "jar/firebase-analytics.jar", "jar/junit.jar"}
+	before := map[string]int{}
+	for _, jar := range jars {
+		before[jar] = bucketOf(jar, depBuckets(len(jars)))
+	}
+
+	// ten jars per bucket: the set crosses to a new count of buckets at eleven, and
+	// until then a dependency added beside these four changes nothing about them
+	for i := 0; i < 6; i++ {
+		jars = append(jars, filepath.Join("jar", "extra"+string(rune('a'+i))+".jar"))
+	}
+	if depBuckets(10) != depBuckets(4) {
+		t.Fatalf("the thresholds moved between four and ten jars: %d and %d", depBuckets(4), depBuckets(10))
+	}
+	for jar, bucket := range before {
+		if got := bucketOf(jar, depBuckets(len(jars))); got != bucket {
+			t.Errorf("%s moved from bucket %d to %d when nothing but a new dependency changed", jar, bucket, got)
+		}
+	}
+
+	// and every jar lands in a bucket that exists: one that folded outside 0..buckets
+	// would be left out of the apk without a word
+	for _, bucket := range []int{1, 3, depsBucketsMax} {
+		for _, jar := range jars {
+			got := bucketOf(jar, bucket)
+			if got < 0 || got >= bucket {
+				t.Errorf("%s in bucket %d of %d", jar, got, bucket)
+			}
+		}
 	}
 }
