@@ -154,9 +154,12 @@ func logcatWindow(answer deviceAnswer, pkg, marker string) []string {
 	window, _ := answer("logcat -d -v threadtime" + from)
 	live, _ := answer("pidof -s " + pkg)
 
-	report := appWindowLines(window, pkg, live)
+	// the crash block is only suppressed down below when it is this app's: another
+	// process dying in the same window is no reason to lose our own stack
+	text := strings.TrimSpace(crash)
+	report := appWindowLines(window, pkg, live, text != "" && strings.Contains(text, pkg))
 	lines := []string{}
-	if text := strings.TrimSpace(crash); text != "" {
+	if text != "" {
 		lines = append(lines, text)
 	}
 	return append(lines, report...)
@@ -176,7 +179,19 @@ var (
 // package, and the continuation lines (stack traces) that follow such a record.
 // A line without the threadtime prefix is not a new record, so it stays with the
 // record before it, which is what keeps a FATAL EXCEPTION readable.
-func appWindowLines(dump, pkg, livePid string) []string {
+//
+// Naming the package is not enough on its own. Measured on this phone, the report of
+// a start that died in onCreate ran to 163 lines, and the reason was in ten of them:
+// the power hal, the window manager, the surface flinger and the vendor's game
+// detector all have something to say about a package name, and none of it is what
+// happened to the app. So a record from another process is kept only when it is the
+// ActivityManager describing our lifecycle, or an error about us.
+//
+// Two records are left out on purpose. The shell that answers us writes its own log
+// of the calls this run made, and a report holding them is describing itself. And the
+// crash records are the main buffer's copy of what the crash buffer just printed,
+// which the caller says with crashShown.
+func appWindowLines(dump, pkg, livePid string, crashShown bool) []string {
 	pids := map[string]bool{}
 	if pid := strings.TrimSpace(livePid); isDigits(pid) {
 		pids[pid] = true
@@ -192,9 +207,19 @@ func appWindowLines(dump, pkg, livePid string) []string {
 			continue
 		}
 
-		mine := strings.Contains(line, pkg)
-		if fields := strings.Fields(line); len(fields) > 3 && pids[fields[2]] {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			ours = false
+			continue
+		}
+		pid, level, tag := fields[2], fields[4], threadTag(fields)
+
+		mine := pids[pid]
+		if strings.Contains(line, pkg) && (lifecycle[tag] || level == "E" || level == "F") {
 			mine = true
+		}
+		if tag == shellTag || (crashShown && tag == crashTag) {
+			mine = false
 		}
 		if mine {
 			for _, re := range []*regexp.Regexp{procStart, procDeath} {
@@ -210,6 +235,29 @@ func appWindowLines(dump, pkg, livePid string) []string {
 	}
 	return lines
 }
+
+// lifecycle names the processes whose word about a package is about that package:
+// the ones that start it, stop it, and finish its activities.
+var lifecycle = map[string]bool{
+	"ActivityManager":     true,
+	"ActivityTaskManager": true,
+}
+
+// logcat pads a short tag to eight columns, which puts the colon in a field of its
+// own, and leaves a long one glued to it. The tag is what says whose record this is.
+func threadTag(fields []string) string {
+	if len(fields) < 6 {
+		return ""
+	}
+	return strings.TrimRight(fields[5], ":")
+}
+
+const (
+	// shellTag is the Shizuku shell logging the very commands of this run.
+	shellTag = "RISH"
+	// crashTag is the record the runtime writes when the app dies.
+	crashTag = "AndroidRuntime"
+)
 
 func isDigits(text string) bool {
 	if text == "" {
@@ -372,8 +420,8 @@ func runRish() *appRun {
 		LogF("run", "the app did not survive its start")
 	}
 
-	// stream logcat for the pid
-	cmd := exec.Command("rish", "-c", "logcat -v color --pid "+pid)
+	// stream logcat for the pid, and stop with the process: see rishStream
+	cmd := exec.Command("rish", "-c", rishStream(pid, pkg))
 	cmd.Stdin = os.Stdin
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
@@ -381,6 +429,21 @@ func runRish() *appRun {
 		LogF("run", err)
 	}
 	return &appRun{cmd: cmd, answer: rish, pkg: pkg, marker: marker}
+}
+
+// rishStream is the log stream with a supervisor written into the device shell.
+//
+// adb's logcat quits when the process it follows dies and the run ends there; on
+// this device, through the Shizuku shell, logcat --pid keeps the session open after
+// the app is gone. The stream then produces nothing, the run waits on it forever,
+// and the report of why the app stopped is never reached unless the user interrupts
+// it. Asking the phone to end the stream when the pid is no longer the one we
+// followed costs one pidof per second on the device and no extra session on Termux,
+// which is the other way round from watching the pid from here.
+func rishStream(pid, pkg string) string {
+	return "logcat -v color --pid " + pid + " & stream=$!; " +
+		"while [ \"$(pidof -s " + pkg + ")\" = \"" + pid + "\" ]; do sleep 1; done; " +
+		"kill $stream 2>/dev/null"
 }
 
 // run builds the apk, installs it and follows the app output until it ends

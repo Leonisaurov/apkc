@@ -6,6 +6,26 @@ import (
 	"testing"
 )
 
+// TestRishStreamOutlivesTheAppUnlessSupervised pins what was measured on the phone:
+// logcat --pid through the Shizuku shell keeps the session after the process dies,
+// so a bare stream would leave the run waiting on a silent pipe and the death report
+// unreachable. The script has to carry the pid it follows, the package to look for,
+// and the kill that ends it.
+func TestRishStreamOutlivesTheAppUnlessSupervised(t *testing.T) {
+	script := rishStream("1234", "com.apkc.demo")
+
+	for _, want := range []string{"logcat -v color --pid 1234", "pidof -s com.apkc.demo", `"1234"`, "kill $stream"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the stream script is missing %q: %s", want, script)
+		}
+	}
+	// the loop runs on the device: watching the pid from here would open a rish
+	// session per check, and one session costs more than the app's whole log
+	if !strings.Contains(script, "sleep 1") {
+		t.Errorf("the supervisor must wait on the device, got %s", script)
+	}
+}
+
 func TestWatchIgnoresEveryFileAaptGenerates(t *testing.T) {
 	for _, path := range []string{"src/com/myapp/R.java", "src/com/myapp/Manifest.java"} {
 		if !isGenerated(path) {
@@ -44,7 +64,7 @@ const startDump = `10-24 10:00:00.100  1200  1200 I ActivityManager: Start proc 
 `
 
 func TestAppWindowLinesFollowAnAppThatLeftNoPid(t *testing.T) {
-	lines := appWindowLines(startDump, "com.myapp", "")
+	lines := appWindowLines(startDump, "com.myapp", "", false)
 
 	joined := strings.Join(lines, "\n")
 	for _, want := range []string{"Start proc 8341", "onCreate", "FATAL EXCEPTION", "bad thing", "has died"} {
@@ -65,7 +85,7 @@ func TestAppWindowLinesFollowAnAppThatLeftNoPid(t *testing.T) {
 }
 
 func TestAppWindowLinesTakeTheLivePidToo(t *testing.T) {
-	lines := appWindowLines(startDump, "com.myapp", "8341")
+	lines := appWindowLines(startDump, "com.myapp", "8341", false)
 	if len(lines) == 0 {
 		t.Fatal("a running app has a window too")
 	}
@@ -73,6 +93,45 @@ func TestAppWindowLinesTakeTheLivePidToo(t *testing.T) {
 		if strings.Contains(line, "wifi scan") {
 			t.Error("the live pid does not make another process ours")
 		}
+	}
+}
+
+// TestAppWindowLinesLeaveTheShellEchoAndTheSecondStack pins two things measured on
+// the phone. The Shizuku shell logs every command this run makes, so its records
+// turn a report about the app into a narration of the tool. And once the crash buffer
+// has been printed, the main buffer's copy of the same stack is a second stack.
+func TestAppWindowLinesLeaveTheShellEchoAndTheSecondStack(t *testing.T) {
+	dump := startDump + "10-24 10:00:00.600  4300  4300 D RISH    : arg2=pidof -s com.myapp\n" +
+		"10-24 10:00:00.700   882   947 I libPowerHal: [perfNotifyAppState] pack:com.myapp, pid:8341, STATE_DEAD\n" +
+		"10-24 10:00:00.800  1200  1200 W PackageManager: component com.myapp/.Old disabled\n" +
+		"10-24 10:00:00.900   900   900 E SystemServer: crash reporting for com.myapp failed\n"
+
+	joined := strings.Join(appWindowLines(dump, "com.myapp", "", true), "\n")
+	for _, unwanted := range []string{"RISH", "FATAL EXCEPTION", "bad thing", "at com.myapp.MainActivity.onCreate", "perfNotifyAppState", "PackageManager"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("the report carries %q, which is the shell talking about us or a stack printed above:\n%s", unwanted, joined)
+		}
+	}
+	for _, want := range []string{"Start proc 8341", "onCreate", "has died"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the report lost %q, and that is not a duplicate", want)
+		}
+	}
+	// an error from another process is about us even when that process is not ours
+	if !strings.Contains(joined, "crash reporting for com.myapp failed") {
+		t.Errorf("the report dropped another process's error about us:\n%s", joined)
+	}
+
+	// with nothing in the crash buffer the stack is the only thing the user gets, and
+	// the shell echo is still not the app's log
+	without := strings.Join(appWindowLines(dump, "com.myapp", "", false), "\n")
+	for _, want := range []string{"FATAL EXCEPTION", "bad thing", "at com.myapp.MainActivity.onCreate"} {
+		if !strings.Contains(without, want) {
+			t.Errorf("with no crash buffer, the report lost %q", want)
+		}
+	}
+	if strings.Contains(without, "RISH") {
+		t.Error("the shell echo is never the app's log, crash buffer or not")
 	}
 }
 
