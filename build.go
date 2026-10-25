@@ -248,7 +248,11 @@ func _build(o buildOpts) {
 	}
 
 	needBundle := !o.incremental || firstRun || typeChanged || compRes || compSource || resStale || classStale ||
-		manifestStale || depChanged || auxStale || resMissing || dexMissing || !exists("build/bundle.zip")
+		manifestStale || depChanged || auxStale || resMissing || dexMissing ||
+		// the jvm backend reads its package back out of bundle.zip to align and sign
+		// it, so a missing one is work. The go backend writes the apk from the plan and
+		// has no intermediate to miss: asking for it there repackaged every idle round
+		(o.signer != signerGo && !exists(filepath.Join("build", "bundle.zip")))
 	if needBundle {
 		if o.signer == signerGo && !o.useAAB {
 			// the package is written below, from the same plan: a bundle.zip that
