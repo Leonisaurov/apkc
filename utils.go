@@ -54,11 +54,12 @@ func prompt(text string, defaultValue string) string {
 // only shape it trusts. Every time the meaning of a record changed the state had
 // to say so: 1 kept mtimes, 2 added the jar fingerprint and the manifest digest,
 // 3 the bundle entries and the api of the project dex, 4 records every tracked
-// file by content instead of by timestamp, 5 the shape of each compiled class. A
-// file from another version is not an error and not a downgrade either: its
-// records are dropped, one round produces everything again, and the next state is
-// whole.
-const stateVersion = 5
+// file by content instead of by timestamp, 5 the shape of each compiled class, 6
+// the constants each class presents, which is what a reader of one inlines into its
+// own bytes. A file from another version is not an error and not a downgrade either:
+// its records are dropped, one round produces everything again, and the next state
+// is whole.
+const stateVersion = 6
 
 type Data struct {
 	Version int    `json:"version"`
@@ -100,11 +101,16 @@ type Data struct {
 	// recompressing a hundred megabytes of assets that did not change.
 	BundleEntries map[string]string `json:"bundleEntries,omitempty"`
 	// ClassAPI maps each compiled class of the project to a digest of the shape it
-	// presented: its members by name and descriptor, what it throws, the value of
-	// its constants. No digest of a source can say whether the code that calls it
-	// still links, because the caller's own file did not change — only what it
-	// promised to the vm did. That question is what this table answers.
+	// presented: its members by name and descriptor, their visibility, what a method
+	// throws. No digest of a source can say whether the code that calls it still
+	// links, because the caller's own file did not change — only what it promised to
+	// the vm did. That question is what this table answers.
 	ClassAPI map[string]string `json:"classApi,omitempty"`
+	// ClassFields keeps the compile time constants each class presented, by
+	// "name:descriptor". javac copies those values into the bytes of whoever reads
+	// them, so a resource id that moved is a change for the sources that read that
+	// id and for nobody else: this table is what tells the two apart.
+	ClassFields map[string]map[string]string `json:"classFields,omitempty"`
 }
 
 const DataFile = "build/incremental.json"

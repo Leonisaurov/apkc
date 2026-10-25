@@ -167,15 +167,12 @@ func _build(o buildOpts) {
 		saveTable()
 	}
 	if !o.incremental || firstRun || typeChanged || compRes || resStale || resMissing || manifestStale {
-		// the files aapt generates were rewritten: the sources that read R.*
-		// constants have to go through javac again, because javac inlines them
-		// into the class files
-		if bundleRes(o.useAAB, o.incremental) {
-			_, unchanged := getFiles("src", ".kt", true)
-			markAsChanged(unchanged)
-			_, unchanged = getFiles("src", ".java", true)
-			markAsChanged(unchanged)
-		}
+		// the files aapt generates are inputs like any other: they are compared by
+		// content, and when a constant inside one of them really moved it is the
+		// dependency index below that sends the sources back, not this call. Marking
+		// every source here used to cost a whole javac pass over a resource that only
+		// added an id, and a copy of a value that did not move was never stale.
+		bundleRes(o.useAAB, o.incremental)
 	}
 
 	compiledKotlin, compKotlin := compileKotlin(o.incremental)
@@ -638,19 +635,35 @@ func closeApiGap(incremental bool, compiled []string) bool {
 		LogD("Incremental", "the shape of", len(unread), "class files could not be read, and they name nothing")
 	}
 	recorded := DataTable.ClassAPI
+	recordedFields := DataTable.ClassFields
 	DataTable.ClassAPI = apiDigests(classes)
+	DataTable.ClassFields = fieldValues(classes)
 	if len(recorded) == 0 {
 		return false
 	}
 
+	// a constant whose value moved, or that stopped existing, is a change every copy
+	// of it has to see — and the copies cannot be found, because javac writes the
+	// number into the reader and keeps no reference to the field it came from. So the
+	// answer is the whole source tree, and nothing else: an added id that moved no
+	// value is invisible to the readers and costs nothing here.
+	moved := constantsMoved(classes, recordedFields)
+
 	callers := withoutSources(staleCallers(classes, recorded), compiled)
-	if len(callers) == 0 {
+	if len(callers) == 0 && !moved {
 		return false
 	}
 
-	LogI("build", "recompiling the callers of a class that changed shape")
-	LogD("Incremental", len(callers), "sources call a class whose shape moved")
-	markAsChanged(callers)
+	if moved {
+		LogI("build", "recompiling every source: a constant value moved")
+		_, unchanged := getFiles("src", ".java", true)
+		_, unchangedKotlin := getFiles("src", ".kt", true)
+		markAsChanged(append(append([]string{}, unchanged...), unchangedKotlin...))
+	} else {
+		LogI("build", "recompiling the callers of a class that changed shape")
+		LogD("Incremental", len(callers), "sources call a class whose shape moved")
+		markAsChanged(callers)
+	}
 
 	// each compiler takes exactly the callers of its own language: the records of
 	// every source listed above were dropped, and the trees they walk only report

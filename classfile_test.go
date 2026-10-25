@@ -292,6 +292,10 @@ func TestClassShapeIgnoresCodeAndNoticesEverythingElse(t *testing.T) {
 	various := map[string]classFixture{
 		"a different method body":   withMethod(base, memberFixture{name: "run", descriptor: "()V", access: 0x1, code: []byte{0x2a, 0x2a, 0xb1}}),
 		"members written reordered": reversedMembers(base),
+		// a constant value is not part of the shape: it travels by itself, because
+		// what it invalidates are the copies of the value, not the readers of the
+		// descriptor, and those copies are invisible to the shape
+		"the value of a constant": withField(base, memberFixture{name: "MAX", descriptor: "J", access: 0x0019, long: pointer(5001)}),
 	}
 	for what, fixture := range various {
 		_, info, err := readClass(fixture.bytes())
@@ -327,8 +331,6 @@ func TestClassShapeIgnoresCodeAndNoticesEverythingElse(t *testing.T) {
 		"public became package":        withMethod(base, memberFixture{name: "run", descriptor: "()V", access: 0x0}),
 		"a class it implements":        withInterface(base, "java.lang.Cloneable"),
 		"a different superclass":       withSuper(base, "java.lang.Thread"),
-		"the value of a constant":      withField(base, memberFixture{name: "MAX", descriptor: "J", access: 0x0019, long: pointer(5001)}),
-		"a constant lost its value":    withField(base, memberFixture{name: "MAX", descriptor: "J", access: 0x0019}),
 		"a method now throws":          withMethod(base, memberFixture{name: "run", descriptor: "()V", access: 0x1, exceptions: []string{"java.io.IOException"}}),
 		"a generic signature appeared": withMethod(base, memberFixture{name: "run", descriptor: "()V", access: 0x1, generic: "<T:Ljava/lang/Object;>V"}),
 	}
@@ -563,6 +565,68 @@ func TestStaleCallersDoesNotInventWork(t *testing.T) {
 	}
 	if !equalStrings(got, []string{"src/demo/Quux.java"}) {
 		t.Errorf("the caller of a changed class must be reported by its own file, got %v", got)
+	}
+}
+
+// TestConstantsMoved is the other half of the invalidation, and the half the compiled
+// output cannot answer on its own: javac copies a constant into the reader and keeps
+// no reference to the field it came from, so the copies cannot be found and a moved
+// value sends the whole source tree back. What this decides is whether anything has to
+// be sent at all.
+func TestConstantsMoved(t *testing.T) {
+	constant := func(v int64) classFixture {
+		return classFixture{name: "demo.Conf", super: "java.lang.Object",
+			fields:  []memberFixture{{name: "MAX", descriptor: "J", access: 0x0019, long: pointer(v)}},
+			methods: []memberFixture{{name: "other", descriptor: "()V", access: 0x1}}}
+	}
+
+	_, same, err := readClass(constant(5).bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded := fieldValues(map[string]classInfo{"demo.Conf": same})
+	if len(recorded["demo.Conf"]) != 1 {
+		t.Fatalf("the constant never reached the index: %v", recorded)
+	}
+
+	if constantsMoved(map[string]classInfo{"demo.Conf": same}, recorded) {
+		t.Error("the same constants reported a move")
+	}
+
+	// a class that only gained a constant: nobody had read the new one yet
+	grew := classFixture{name: "demo.Conf", super: "java.lang.Object",
+		fields: []memberFixture{
+			{name: "MAX", descriptor: "J", access: 0x0019, long: pointer(5)},
+			{name: "MIN", descriptor: "J", access: 0x0019, long: pointer(1)},
+		},
+		methods: []memberFixture{{name: "other", descriptor: "()V", access: 0x1}}}
+	_, grewInfo, err := readClass(grew.bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if constantsMoved(map[string]classInfo{"demo.Conf": grewInfo}, recorded) {
+		t.Error("an added constant cannot have stale copies")
+	}
+
+	// the value moved, which is exactly what a copy of it now gets wrong
+	_, movedValue, _ := readClass(constant(6).bytes())
+	if !constantsMoved(map[string]classInfo{"demo.Conf": movedValue}, recorded) {
+		t.Error("a constant that changed value was not reported as moved")
+	}
+
+	// the field stopped being a constant: every copy is now a stale number
+	stopped := constant(5)
+	stopped.fields = []memberFixture{{name: "MAX", descriptor: "J", access: 0x0001}}
+	_, stoppedInfo, _ := readClass(stopped.bytes())
+	if !constantsMoved(map[string]classInfo{"demo.Conf": stoppedInfo}, recorded) {
+		t.Error("a field that lost its constant value was not reported as moved")
+	}
+
+	if !constantsMoved(map[string]classInfo{}, recorded) {
+		t.Error("a class that vanished left its constants unreported")
+	}
+	if constantsMoved(map[string]classInfo{"demo.Conf": same}, nil) {
+		t.Error("without history there is nothing to have moved")
 	}
 }
 

@@ -104,15 +104,19 @@ func (p *pool) constantOf(i int) string {
 // classInfo is what the index keeps about one compiled class.
 type classInfo struct {
 	// API digests the shape a caller links against: the name, the supertype and
-	// interfaces, the access flags, every field and method by name and descriptor
-	// with their generic signature, the exceptions a method declares and the value
-	// of a constant field. The code is not in it, so editing a body costs nobody a
-	// recompilation.
+	// interfaces, the access flags, and every field and method by name and descriptor
+	// with their generic signature and declared exceptions. Neither the code nor the
+	// value of a constant is in it: a constant travels by itself, in Fields, because
+	// the callers it invalidates are the ones that read that field and nobody else.
 	API string
 	// Refs are every class the constant pool names, platform and jar classes
 	// included: a caller of a class the project stopped compiling still carries its
 	// name, and that is what says the caller has work to do.
 	Refs []string
+	// Fields are the constants this class presents, by "name:descriptor". javac
+	// copies the value into the reader's own bytes, so a value that moved is a change
+	// for whoever read it — and the copy leaves no reference behind to follow.
+	Fields map[string]string
 }
 
 // readClass takes the name, the shape and the referenced classes out of the bytes of
@@ -148,9 +152,27 @@ func readClass(data []byte) (string, classInfo, error) {
 	}
 	name := p.classOf(own)
 	return name, classInfo{
-		API:  shapeOf(name, access, p.classOf(super), interfaces, fields, methods),
-		Refs: refs,
+		API:    shapeOf(name, access, p.classOf(super), interfaces, fields, methods),
+		Refs:   refs,
+		Fields: constants(fields),
 	}, nil
+}
+
+// constants is the map of "name:descriptor" to value that a class presents as a
+// compile time constant. A field without a ConstantValue attribute is not in it: a
+// caller links against its descriptor, which the shape already covers, and does not
+// hold a copy of anything.
+func constants(fields []member) map[string]string {
+	out := map[string]string{}
+	for _, m := range fields {
+		if m.constant != "" {
+			out[m.name+":"+m.descriptor] = m.constant
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // shapeOf is the digest of a class as seen from outside it. Fields and methods are
@@ -168,9 +190,6 @@ func shapeOf(name string, access int, super string, interfaces []string, fields,
 		fmt.Fprintf(&b, "\n  field %s %s:%s", m.visibility(), m.name, m.descriptor)
 		if m.signature != "" {
 			fmt.Fprintf(&b, " generic=%s", m.signature)
-		}
-		if m.constant != "" {
-			fmt.Fprintf(&b, " value=%s", m.constant)
 		}
 	}
 	for _, m := range methods {
@@ -265,6 +284,46 @@ func apiDigests(classes map[string]classInfo) map[string]string {
 	return out
 }
 
+// fieldValues is the part of the index that answers "which constants moved": one map
+// of name:descriptor to value per class, with the classes that present no constants
+// left out entirely so the state stays the size of the constants and not of the
+// project.
+func fieldValues(classes map[string]classInfo) map[string]map[string]string {
+	out := map[string]map[string]string{}
+	for name, info := range classes {
+		if len(info.Fields) > 0 {
+			out[name] = info.Fields
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// constantsMoved answers whether a value some other class could have copied is no
+// longer the value it had.
+//
+// This cannot be answered per reader, and the reason is in the compiled output: when
+// javac sees a static final constant it puts the *value* in the caller's bytes and
+// leaves no reference to the field behind — a read of LIMIT compiles to a bipush,
+// with no Fieldref and not even a mention of the owner class. So the class index
+// knows the value moved; it does not know who copied it. Everything that could have
+// copied it therefore goes back through the compiler, and a build that only added
+// constants, moving nothing, is what costs nothing.
+func constantsMoved(current map[string]classInfo, recorded map[string]map[string]string) bool {
+	for name, values := range recorded {
+		now := current[name]
+		for field, old := range values {
+			value, still := now.Fields[field]
+			if !still || value != old {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // staleCallers answers what javac has to see again because the shape of a class it
 // links against moved.
 //
@@ -290,6 +349,7 @@ func staleCallers(current map[string]classInfo, recorded map[string]string) []st
 			dirty[name] = true
 		}
 	}
+
 	if len(dirty) == 0 {
 		return nil
 	}
@@ -317,9 +377,9 @@ func staleCallers(current map[string]classInfo, recorded map[string]string) []st
 
 	sources := []string{}
 	seen := map[string]bool{}
-	for name := range dirty {
+	add := func(name string) {
 		if own[name] {
-			continue // its source was compiled this round: the callers are the work
+			return // its source was compiled this round: the callers are the work
 		}
 		src := classSource(name)
 		if src != "" && !seen[src] {
@@ -327,6 +387,10 @@ func staleCallers(current map[string]classInfo, recorded map[string]string) []st
 			sources = append(sources, src)
 		}
 	}
+	for name := range dirty {
+		add(name)
+	}
+
 	sort.Strings(sources)
 	return sources
 }
