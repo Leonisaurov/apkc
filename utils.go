@@ -57,10 +57,14 @@ func prompt(text string, defaultValue string) string {
 // file by content instead of by timestamp, 5 the shape of each compiled class, 6
 // the constants each class presents, which is what a reader of one inlines into its
 // own bytes, 7 the SHA-256 of every packaged entry, which is what the JAR signature
-// digests. A file from another version is not an error and not a downgrade either:
+// digests, 8 because an apk written by the version before that carries an entry whose
+// name folds past 72 bytes is signed over everything except that entry: nothing in the
+// records of a state can tell that the packager itself changed its mind, so the trust
+// has to end here and one round repackage the world.
+// A file from another version is not an error and not a downgrade either:
 // its records are dropped, one round produces everything again, and the next state
 // is whole.
-const stateVersion = 7
+const stateVersion = 8
 
 type Data struct {
 	Version int    `json:"version"`

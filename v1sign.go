@@ -98,11 +98,32 @@ func signatureFile(manifest []byte, schemes []int) []byte {
 		if !strings.HasPrefix(section, attrName+":") {
 			continue
 		}
-		writeAttr(&b, attrName, strings.SplitN(section[len(attrName)+2:], "\r\n", 2)[0])
+		writeAttr(&b, attrName, attrValue(section, attrName))
 		writeAttr(&b, attrDigest, base64SHA256([]byte(section)))
 		b.WriteString("\r\n")
 	}
 	return []byte(b.String())
+}
+
+// attrValue reads one attribute back out of a manifest section, joining the continuation
+// lines a folded value left behind. The signature file needs the whole of a name: taking
+// only the first physical line of a long one writes an .SF section for an entry that does
+// not exist and no section at all for the one that does. apksigner does not call that a
+// failure — it verifies what the .SF lists — and on the Firebase demo, whose drawable
+// names run past the 72 byte limit, four of its entries shipped outside the signature.
+func attrValue(section, attr string) string {
+	lines := strings.Split(section, "\r\n")
+	if len(lines) == 0 || !strings.HasPrefix(lines[0], attr+": ") {
+		return ""
+	}
+	value := lines[0][len(attr)+2:]
+	for _, line := range lines[1:] {
+		if !strings.HasPrefix(line, " ") {
+			break
+		}
+		value += line[1:]
+	}
+	return value
 }
 
 // writeAttr writes one attribute the way java.util.jar does, folding any line past

@@ -240,3 +240,57 @@ func TestPKCS7SignatureVerifiesFromItsOwnBytes(t *testing.T) {
 		t.Error("a block was produced without a certificate")
 	}
 }
+
+// TestSignatureFileCoversTheNamesTooLongForOneLine is the regression of the fold. A
+// resource name past the 72 byte limit reaches the .SF through the manifest, where it is
+// already folded, and a reader that takes the first physical line of that section signs
+// half a name: the entry then has no section at all, apksigner still says the apk
+// verifies because it only checks the entries the .SF mentions, and jarsigner says the
+// rest are unsigned. On the Firebase demo that put four drawables outside the v1
+// signature, which is the signature a device under API 24 is left with.
+func TestSignatureFileCoversTheNamesTooLongForOneLine(t *testing.T) {
+	long := "res/drawable-hdpi-v4/" + strings.Repeat("common_google_signin_btn_icon_", 4) +
+		"dark_normal_background.9.png"
+	if len(attrName+": "+long) <= 72 {
+		t.Fatalf("the fixture has to be long enough to fold, it is %d", len(long))
+	}
+	files := []v1File{
+		{name: "classes.dex", digest: base64SHA256([]byte("dex"))},
+		{name: long, digest: base64SHA256([]byte("png"))},
+	}
+	sf := string(signatureFile(jarManifest(files), []int{1, 2}))
+
+	// unfolded here and not with attrValue: the test has to disagree with the code if
+	// the code is wrong, and it was exactly this reading that broke
+	names := map[string]bool{}
+	sections := 0
+	for _, section := range strings.SplitAfter(sf, "\r\n\r\n")[1:] {
+		lines := strings.Split(section, "\r\n")
+		if len(lines) == 0 || !strings.HasPrefix(lines[0], attrName+": ") {
+			continue
+		}
+		sections++
+		value := lines[0][len(attrName)+2:]
+		for _, line := range lines[1:] {
+			if !strings.HasPrefix(line, " ") {
+				break
+			}
+			value += line[1:]
+		}
+		names[value] = true
+	}
+	if sections != len(files) {
+		t.Errorf("the .SF has %d sections for %d entries", sections, len(files))
+	}
+	for _, f := range files {
+		if !names[f.name] {
+			t.Errorf("the entry %q is not covered by the .SF: it is unsigned", f.name)
+		}
+	}
+	// and nothing was written under a truncated form of the name
+	for name := range names {
+		if name != "classes.dex" && name != long {
+			t.Errorf("a section names %q, which is not an entry of the package", name)
+		}
+	}
+}
