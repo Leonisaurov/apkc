@@ -4,8 +4,10 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -14,6 +16,10 @@ import (
 // JVM: keytool wrote JKS until JDK 8 and PKCS#12 since, and both are still in
 // use under ~/.android.
 const jksMagic = uint32(0xFEEDFEED)
+
+func isJKSHead(head []byte) bool {
+	return len(head) >= 4 && binary.BigEndian.Uint32(head[:4]) == jksMagic
+}
 
 // signingKey is what the signer asks of the keystore: a key to sign with and the
 // certificate that has to travel inside the signature block, so the platform can
@@ -24,7 +30,7 @@ func signingKey(path, password, alias string) (crypto.Signer, *x509.Certificate,
 		return nil, nil, err
 	}
 
-	if len(blob) >= 4 && uint32(blob[0])<<24|uint32(blob[1])<<16|uint32(blob[2])<<8|uint32(blob[3]) == jksMagic {
+	if isJKSHead(blob) {
 		return nil, nil, fmt.Errorf("%s is a JKS keystore: the Go signer reads PKCS#12, convert it with keytool -importkeystore -storetype PKCS12 or build with --signer=jvm", path)
 	}
 
@@ -48,6 +54,26 @@ func signingKey(path, password, alias string) (crypto.Signer, *x509.Certificate,
 		"valid to", material.Cert.NotAfter.Format("2006-01-02"), "mac algorithm", material.MacAlgo)
 
 	return material.Signer, material.Cert, nil
+}
+
+// keystoreIsPKCS12 answers what the Go signer can open without reading the key:
+// PKCS#12 is an ASN.1 SEQUENCE, so its first byte is 0x30, while JKS starts with the
+// magic below. The name inside the file is no help, keytool writes both formats with
+// the same extension, and a debug keystore of one JDK is a PKCS#12 of the next.
+func keystoreIsPKCS12(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	var head [4]byte
+	if _, err := io.ReadFull(f, head[:]); err != nil {
+		return false
+	}
+	// a PKCS#12 file is an ASN.1 SEQUENCE: 0x30 in front and no JKS magic, which is
+	// what the two formats have to tell each other apart by
+	return head[0] == 0x30 && !isJKSHead(head[:])
 }
 
 // rsaKey narrows the signer to the algorithm a debug keystore uses, so an

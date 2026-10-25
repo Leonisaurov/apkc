@@ -22,14 +22,42 @@ import (
 )
 
 // signer choices. jvm is the default and the one with years of production behind it;
-// go is the new path, opt-in until it has been installed on a phone.
+// go is the new path; auto lets the two facts that decide whether go is allowed speak
+// for themselves, which is what a wrapper passes once instead of thinking per project.
 const (
-	signerJVM = "jvm"
-	signerGo  = "go"
+	signerJVM  = "jvm"
+	signerGo   = "go"
+	signerAuto = "auto"
 
 	// v2 is checked by the platform from API 24 up
 	minAPIForV2Only = 24
 )
+
+// resolveSigner turns the choice on the command line into the backend this build can
+// actually use, and says why for the ones auto settles by itself. The two conditions
+// are the two limits of the Go packager: a package under API 24 needs the JAR
+// signature it does not write, and a JKS keystore is a format it refuses to read.
+//
+// An explicit --signer=go is not second-guessed here: v2RefuseBelow is what tells the
+// user their chosen backend cannot serve the project.
+func resolveSigner(signer string, api int, keyPath string, useAAB bool) string {
+	if signer != signerAuto {
+		return signer
+	}
+	switch {
+	case useAAB:
+		LogD("sign", "--signer=auto: a bundle is signed by jarsigner, so the jvm backend it is")
+		return signerJVM
+	case api < minAPIForV2Only:
+		LogD("sign", "--signer=auto: minSdkVersion", api, "needs the v1 signature only apksigner writes")
+		return signerJVM
+	case !keystoreIsPKCS12(keyPath):
+		LogD("sign", "--signer=auto:", keyPath, "is not a PKCS#12 keystore, and only the jvm backend reads the rest")
+		return signerJVM
+	}
+	LogD("sign", "--signer=auto: go signs this package, no zipalign and no apksigner")
+	return signerGo
+}
 
 // packageWithGo writes build/app.apk from the plan. It reports how many entries came
 // over from the previous package unchanged, which is the number that shows whether the

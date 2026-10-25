@@ -342,6 +342,56 @@ func TestBMPStringIsThePasswordPKCS12DerivesFrom(t *testing.T) {
 	}
 }
 
+// TestResolveSigner is the whole of --signer=auto: two facts about the project decide
+// it, and an explicit choice is never overruled. The cost of getting this wrong is
+// asymmetric in opposite directions: an apk without the v1 signature installs on
+// nothing below Android 7, and a JKS keystore is a file this binary cannot open.
+func TestResolveSigner(t *testing.T) {
+	dir := t.TempDir()
+	p12 := filepath.Join(dir, "release.p12")
+	jks := filepath.Join(dir, "old.jks")
+	for path, head := range map[string][]byte{p12: {0x30, 0x82, 0x01, 0x02}, jks: {0xFE, 0xED, 0xFE, 0xED}} {
+		if err := os.WriteFile(path, append(head, make([]byte, 16)...), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name   string
+		signer string
+		api    int
+		key    string
+		aab    bool
+		want   string
+	}{
+		{"an explicit jvm stays", signerJVM, 34, p12, false, signerJVM},
+		{"an explicit go is not second guessed", signerGo, 21, jks, false, signerGo},
+		{"auto takes the go path when both hold", signerAuto, 26, p12, false, signerGo},
+		{"auto stays on api 26 with room", signerAuto, 24, p12, false, signerGo},
+		{"auto refuses below the v2 check", signerAuto, 21, p12, false, signerJVM},
+		{"auto refuses a JKS keystore", signerAuto, 34, jks, false, signerJVM},
+		{"auto refuses a keystore that is not there", signerAuto, 34, filepath.Join(dir, "absent.p12"), false, signerJVM},
+		{"auto leaves a bundle to jarsigner", signerAuto, 34, p12, true, signerJVM},
+	}
+	for _, c := range cases {
+		if got := resolveSigner(c.signer, c.api, c.key, c.aab); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// the two formats have to be told apart by what a reader can see without a JVM,
+	// because both arrive with the same extension and under the same name
+	if !keystoreIsPKCS12(p12) {
+		t.Error("a PKCS#12 header was not recognised")
+	}
+	if keystoreIsPKCS12(jks) {
+		t.Error("a JKS header was read as PKCS#12")
+	}
+	if keystoreIsPKCS12(filepath.Join(dir, "absent.p12")) {
+		t.Error("a file that is not there cannot be a keystore format")
+	}
+}
+
 func TestRSAKeyNamesTheAlgorithmItRefuses(t *testing.T) {
 	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
