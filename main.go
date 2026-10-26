@@ -29,6 +29,9 @@ func main() {
 		watch()
 	case "clean":
 		clean()
+	case "version":
+		// what a script asks when it has to know which apkc answered the rest
+		fmt.Println(buildStamp())
 	}
 
 	LogV("apkc", "finished in", time.Since(start))
@@ -45,5 +48,6 @@ build  - build apk (--inc for an incremental build, --aab for an app bundle,
 run    - build apk and run it on an available device (--inc, --rish)
 watch  - rebuild on every change (--inc, --run installs and follows the app)
 clean  - delete build/ dir
+version - print the commit this binary was built from
 `)
 }

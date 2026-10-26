@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 
@@ -49,9 +50,59 @@ var (
 )
 
 // doctor command checks all the sdk and binary paths are valid
+// formatBuildStamp is the answer to "which apkc produced this number", said in the words
+// a log can be searched for. It exists because two rounds of verification in this
+// project were spent on output from an old release that was still in PATH, and nothing
+// the tool printed could tell them apart: a build made from a checkout names its commit
+// and says whether the tree was dirty when it was compiled, and a build made any other
+// way says that instead of pretending.
+func formatBuildStamp(settings []debug.BuildSetting, modulePath string) string {
+	revision, modified, built := "", "", ""
+	for _, s := range settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		case "vcs.time":
+			built = s.Value
+		}
+	}
+	if revision == "" {
+		if modulePath == "" {
+			return "no commit information in this build"
+		}
+		return "no commit information in this build (" + modulePath + ")"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	stamp := revision
+	if built != "" {
+		stamp += ", built " + built
+	}
+	if modified == "true" {
+		stamp += ", with files not committed"
+	}
+	return stamp
+}
+
+// buildStamp reads what go embedded in this binary at compile time. A build that did not
+// come from a module at all answers with nothing to show, which is the same answer as a
+// build with no version control: the point is to never print a commit that is not this
+// binary's.
+func buildStamp() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info == nil {
+		return formatBuildStamp(nil, "")
+	}
+	return formatBuildStamp(info.Settings, info.Main.Path)
+}
+
 func doctor() {
 	findSDKs()
 
+	LogI("doctor", "this build:", buildStamp())
 	LogI("doctor", "java", javaPath)
 	LogI("doctor", "javac", javacPath)
 
