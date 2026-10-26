@@ -77,9 +77,12 @@ func formatBuildStamp(settings []debug.BuildSetting, modulePath string) string {
 	if len(revision) > 12 {
 		revision = revision[:12]
 	}
+	// vcs.time is the commit's own date, not the moment the binary was compiled: two
+	// builds of one commit print the same stamp, which is the point, and saying "built"
+	// would promise a difference that is not there. What separates them is the tree.
 	stamp := revision
 	if built != "" {
-		stamp += ", built " + built
+		stamp += " (" + built + ")"
 	}
 	if modified == "true" {
 		stamp += ", with files not committed"
