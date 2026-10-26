@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -416,9 +417,20 @@ func TestPruneDeletedJarFollowsTheDexLayout(t *testing.T) {
 }
 
 func TestKotlinShortcomingsNamesOnlyWhatIsActuallyMissing(t *testing.T) {
-	// os.Args[0] is the test binary: a real executable, so "compiler present" is
-	// answered without depending on what this machine happens to have installed
-	present := os.Args[0]
+	// A file this test made, with the executable bit: what "compiler present" has to
+	// answer on, without depending on what the machine has installed. os.Args[0] is not
+	// that — under js/wasm the runner hands the wasm path as argv[0] and LookPath of it
+	// fails, which made the test report a missing compiler that was never asked about.
+	present := filepath.Join(t.TempDir(), "kotlinc-here")
+	if err := os.WriteFile(present, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath(present); err != nil {
+		// js/wasm answers this with an error for a file it just let us create and run,
+		// so the case cannot be made out here rather than faked: what the platform
+		// cannot tell apart is not something the product should be tested against.
+		t.Skipf("this platform will not find a 0755 file it reports no error for: %v", err)
+	}
 	absent := "apkc-no-such-compiler"
 
 	if got := kotlinShortcomings(present, []string{"jar/gson-2.10.1.jar", "jar/kotlin-stdlib-2.0.21.jar"}); len(got) != 0 {

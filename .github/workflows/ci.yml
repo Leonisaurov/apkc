@@ -38,6 +38,16 @@ jobs:
       - name: test
         run: go test ./...
 
+      # what apkc owns runs in the browser too: the signature, the zip writer and both
+      # keystore readers pass under node. What cannot run there is the toolchain it
+      # starts, which is why this is a test step and not a build of an apk.
+      - name: test under js/wasm
+        env:
+          GOOS: js
+          GOARCH: wasm
+          CGO_ENABLED: "0"
+        run: go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 ./...
+
       # apkc runs nothing on its own without an sdk and a jdk beside it, but its own code
       # still has to compile for every system someone may have in front of them, and a
       # 0xCAFEBABE kept in a 32 bit int showed that is not something to assume.
