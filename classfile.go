@@ -27,7 +27,9 @@ import (
 )
 
 // classMagic is the first four bytes of every class file, JVMS 4.1.
-const classMagic = 0xCAFEBABE
+// It is typed because the constant is bigger than the largest int on a 32-bit build, where an
+// untyped literal overflows and the package stops compiling.
+const classMagic uint32 = 0xCAFEBABE
 
 // The constant pool tags of JVMS 4.4 that a class file of this era can hold. An
 // unknown tag is a read error, not a guess: skipping an entry by a length nobody
@@ -457,13 +459,27 @@ func (c *cursor) u2() int {
 
 func (c *cursor) bytes(n int) []byte { return c.want(n) }
 
-// u4 reads the unsigned int of JVMS 3, which is what an attribute length is.
-func (c *cursor) u4() int {
+// u4 reads the unsigned int of JVMS 3, which is what an attribute length is. It is
+// unsigned on purpose: the first four bytes of a class file are 0xCAFEBABE, and on a
+// 32-bit build that value has no int at all.
+func (c *cursor) u4() uint32 {
 	b := c.want(4)
 	if len(b) < 4 {
 		return 0
 	}
-	return int(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// u4bytes reads one of those lengths and takes the bytes it claims. The check against
+// what is left is here rather than left to want, because on a 32-bit build a length
+// over 2^31 would arrive as a negative int.
+func (c *cursor) u4bytes() []byte {
+	n := c.u4()
+	if n > uint32(len(c.b)-c.at) {
+		c.bad = fmt.Sprintf("needs %d bytes at %d of %d", n, c.at, len(c.b))
+		return nil
+	}
+	return c.bytes(int(n))
 }
 
 // u2s reads a count followed by that many indices.
@@ -531,7 +547,7 @@ func (c *cursor) members(p *pool, kind string) []member {
 		attrs := c.u2()
 		for a := 0; a < attrs && !c.failed(); a++ {
 			name := p.text(c.u2())
-			content := c.bytes(c.u4())
+			content := c.u4bytes()
 			sub := &cursor{b: content}
 			switch name {
 			case "ConstantValue":
