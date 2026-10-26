@@ -46,10 +46,15 @@ const (
 const minAPIForSHA256Digest = 18
 
 // resolveSigner turns the choice on the command line into the backend this build can
-// actually use, and says why for the ones auto settles by itself. The three things it
-// checks are the three limits of the Go packager: a bundle is assembled and signed by
-// other tools, a JKS keystore is a format it refuses to read, and a package under API
-// 18 is verified by a platform that cannot read the digests it writes.
+// actually use. The three things it checks are the three limits of the Go packager: a
+// bundle is assembled and signed by other tools, a JKS keystore is a format it refuses
+// to read, and a package under API 18 is verified by a platform that cannot read the
+// digests it writes.
+//
+// Only a refusal is logged. The round that takes the Go path says so later, at the stage
+// that writes the package, and a watcher that resolves the same answer every round has
+// nothing to report about a round that changed nothing — which is the noise this decision
+// would add to every idle cycle of watch.
 //
 // An explicit --signer=go is not second-guessed here: the user who names a backend gets
 // that backend and its error, not a different one chosen behind their back.
@@ -68,7 +73,6 @@ func resolveSigner(signer string, api int, keyPath string, useAAB bool) string {
 		LogD("sign", "--signer=auto: minSdkVersion", api, "is old enough that its platform reads SHA-1 jar digests, which only apksigner writes")
 		return signerJVM
 	}
-	LogD("sign", "--signer=auto: go signs this package, no zipalign and no apksigner")
 	return signerGo
 }
 

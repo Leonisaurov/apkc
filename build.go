@@ -350,7 +350,7 @@ func _build(o buildOpts) {
 			// a touch of a resource recompiles and relinks it with the same bytes,
 			// and the round would otherwise end in silence: the apk on disk is the
 			// one this package was made from
-			LogD("build", "the package bytes did not change: the apk on disk stands")
+			LogD("build", "the package did not change: the apk on disk stands")
 		}
 	}
 
