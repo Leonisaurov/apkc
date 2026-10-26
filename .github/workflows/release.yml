@@ -1,0 +1,112 @@
+name: release
+
+# apkc is one Go binary and no shared library, so a release is a file per system and
+# architecture. Nothing here is published by hand: the tag decides the version, and the
+# binary answers with its own commit through `apkc version`, which is how a download is
+# checked against this file.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: 386
+          - goos: windows
+            goarch: arm64
+          - goos: freebsd
+            goarch: amd64
+          - goos: openbsd
+            goarch: amd64
+          # wasm compiles and says what it cannot do; it is here because excluding it was
+          # the answer that hid a 32-bit bug for as long as it held.
+          - goos: js
+            goarch: wasm
+          - goos: wasip1
+            goarch: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -e
+          ext=""
+          case "$GOOS/$GOARCH" in
+            windows/*) ext=".exe" ;;
+            */wasm) ext=".wasm" ;;
+          esac
+          name="apkc-$TAG-$GOOS-$GOARCH$ext"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/$name" .
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          # the one build the runner can execute answers for its own commit, which is
+          # what a download gets compared against
+          if [ "$GOOS" = "$(go env GOHOSTOS)" ] && [ "$GOARCH" = "$(go env GOHOSTARCH)" ]; then
+            "./dist/$name" version
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd dist
+          ls -1
+          cat *.sha256 > SHA256SUMS
+          flags=(--title "$GITHUB_REF_NAME" --generate-notes)
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" apkc-* SHA256SUMS
