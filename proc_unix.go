@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !js && !wasip1
 
 package main
 
@@ -6,6 +6,10 @@ import (
 	"os/exec"
 	"syscall"
 )
+
+// watchUnavailable is empty here: this platform runs external programs and reports
+// their file system changes, which is all watch needs to exist.
+const watchUnavailable = ""
 
 // roundProcAttr puts every round of watch in its own process group. With --run
 // the round starts adb or rish logcat as a grandchild that inherits our stdout,

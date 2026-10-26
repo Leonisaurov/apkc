@@ -7,6 +7,10 @@ import (
 	"syscall"
 )
 
+// watchUnavailable is empty here: Windows starts the round and fsnotify sees the
+// tree, so watch works; only the killing of a whole group does not, see below.
+const watchUnavailable = ""
+
 // roundProcAttr has nothing to set here: process groups are a Unix idea, and on
 // Windows the equivalent (job objects) is not worth a dependency for a tool that
 // runs adb, which has no logcat to leak.

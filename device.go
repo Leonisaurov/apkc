@@ -512,6 +512,10 @@ func watch() {
 
 	o := flags.opts()
 
+	if watchUnavailable != "" {
+		LogF("watch", watchUnavailable)
+	}
+
 	// every round is a separate apkc process: a failed build aborts its own
 	// process with LogF, and the watcher survives to take the next change
 	round := []string{"build"}
