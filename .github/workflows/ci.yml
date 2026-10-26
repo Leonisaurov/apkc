@@ -37,3 +37,17 @@ jobs:
 
       - name: test
         run: go test ./...
+
+      # apkc no es un binario que corra solo: necesita un sdk y un jdk al lado. Aun asi
+      # el codigo propio tiene que compilar en todo lo que pueda tener uno delante, y un
+      # 0xCAFEBABE guardado en un int de 32 bits ya demostro que eso no se comprueba solo.
+      - name: cross-compile
+        run: |
+          set -e
+          for target in linux/amd64 linux/386 linux/arm64 linux/arm \
+                        darwin/amd64 darwin/arm64 \
+                        windows/amd64 windows/386 windows/arm64 \
+                        freebsd/amd64 openbsd/amd64; do
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null .
+            echo "ok $target"
+          done
