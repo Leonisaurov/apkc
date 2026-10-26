@@ -24,24 +24,36 @@ import (
 	"time"
 )
 
-// signer choices. jvm is the default and the one with years of production behind it;
-// go is the other one; auto lets the facts that decide which of the two can serve the
-// project speak for themselves, which is what a wrapper passes once instead of thinking
-// per project.
+// signer choices. go is the one that keeps a round from starting two JVMs; jvm is the
+// one with years of production behind it and the only one that reads a JKS keystore,
+// assembles a bundle or signs a package the way a platform older than 4.3 reads one.
+// signerDefault is what a build uses when the command line says nothing, and auto is
+// the answer that lets the facts that decide the backend speak instead of a guess made
+// once per project by whoever wrote the wrapper.
 const (
-	signerJVM  = "jvm"
-	signerGo   = "go"
-	signerAuto = "auto"
+	signerJVM     = "jvm"
+	signerGo      = "go"
+	signerAuto    = "auto"
+	signerDefault = signerAuto
 )
 
+// minAPIForSHA256Digest is the level apksigner itself draws at when it decides whether
+// the JAR signature has to carry SHA-1 digest pairs along with the SHA-256 ones: the
+// platform can read a SHA-256 digest out of a manifest from 4.3 up, and below that it
+// only knows SHA-1. What apkc writes is SHA-256, and a signature over an algorithm an
+// absent device is the only witness of is not something a signing tool should guess at,
+// so auto leaves a project of that age to the backend that has been shipping one.
+const minAPIForSHA256Digest = 18
+
 // resolveSigner turns the choice on the command line into the backend this build can
-// actually use, and says why for the ones auto settles by itself.
+// actually use, and says why for the ones auto settles by itself. The three things it
+// checks are the three limits of the Go packager: a bundle is assembled and signed by
+// other tools, a JKS keystore is a format it refuses to read, and a package under API
+// 18 is verified by a platform that cannot read the digests it writes.
 //
-// What the Go packager cannot do is read a JKS keystore, and assemble a bundle at
-// all: those two, and nothing else. The api level used to be a third reason, while it
-// wrote no JAR signature; it writes one now, so a minSdkVersion of 19 is served by the
-// same code as one of 33.
-func resolveSigner(signer string, keyPath string, useAAB bool) string {
+// An explicit --signer=go is not second-guessed here: the user who names a backend gets
+// that backend and its error, not a different one chosen behind their back.
+func resolveSigner(signer string, api int, keyPath string, useAAB bool) string {
 	if signer != signerAuto {
 		return signer
 	}
@@ -51,6 +63,9 @@ func resolveSigner(signer string, keyPath string, useAAB bool) string {
 		return signerJVM
 	case !keystoreIsPKCS12(keyPath):
 		LogD("sign", "--signer=auto:", keyPath, "is not a PKCS#12 keystore, and only the jvm backend reads the rest")
+		return signerJVM
+	case api < minAPIForSHA256Digest:
+		LogD("sign", "--signer=auto: minSdkVersion", api, "is old enough that its platform reads SHA-1 jar digests, which only apksigner writes")
 		return signerJVM
 	}
 	LogD("sign", "--signer=auto: go signs this package, no zipalign and no apksigner")

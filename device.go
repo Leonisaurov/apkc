@@ -525,7 +525,9 @@ func watch() {
 	if o.coreLibrary {
 		args = append(args, "--core-library")
 	}
-	if o.signer != signerJVM {
+	// only what the user asked for that is not what the child would do anyway: the
+	// value here is still the raw flag, because auto is resolved inside the build
+	if o.signer != signerDefault {
 		args = append(args, "--signer", o.signer)
 	}
 	if *useRish {

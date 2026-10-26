@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
+	"flag"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -342,9 +343,11 @@ func TestBMPStringIsThePasswordPKCS12DerivesFrom(t *testing.T) {
 	}
 }
 
-// TestResolveSigner is the whole of --signer=auto: what the packager can read and what
-// it can build decide it, and an explicit choice is never overruled. A JKS keystore is
-// the case that matters, because the other backend is the only way to use one.
+// TestResolveSigner is the whole of --signer=auto: what the packager can read, what it
+// can build and what the target platform can verify decide it, and an explicit choice is
+// never overruled. A JKS keystore is the case that matters for a wrapper, because the
+// other backend is the only way to use one; the api level is the case that matters for a
+// user, because a SHA-256 manifest means nothing to a platform that reads SHA-1.
 func TestResolveSigner(t *testing.T) {
 	dir := t.TempDir()
 	p12 := filepath.Join(dir, "release.p12")
@@ -358,21 +361,33 @@ func TestResolveSigner(t *testing.T) {
 	cases := []struct {
 		name   string
 		signer string
+		api    int
 		key    string
 		aab    bool
 		want   string
 	}{
-		{"an explicit jvm stays", signerJVM, p12, false, signerJVM},
-		{"an explicit go is not second guessed", signerGo, jks, false, signerGo},
-		{"auto takes the go path over a PKCS#12 keystore", signerAuto, p12, false, signerGo},
-		{"auto refuses a JKS keystore", signerAuto, jks, false, signerJVM},
-		{"auto refuses a keystore that is not there", signerAuto, filepath.Join(dir, "absent.p12"), false, signerJVM},
-		{"auto leaves a bundle to jarsigner", signerAuto, p12, true, signerJVM},
+		{"an explicit jvm stays", signerJVM, 26, p12, false, signerJVM},
+		{"an explicit go is not second guessed", signerGo, 26, jks, false, signerGo},
+		{"an explicit go over a project that reads SHA-1 stays go", signerGo, 16, p12, false, signerGo},
+		{"auto takes the go path over a PKCS#12 keystore", signerAuto, 26, p12, false, signerGo},
+		{"auto takes it at the boundary too", signerAuto, minAPIForSHA256Digest, p12, false, signerGo},
+		{"auto refuses the SHA-1 strip below it", signerAuto, minAPIForSHA256Digest - 1, p12, false, signerJVM},
+		{"auto refuses a manifest that names no minSdkVersion", signerAuto, 0, p12, false, signerJVM},
+		{"auto refuses a JKS keystore", signerAuto, 26, jks, false, signerJVM},
+		{"auto refuses a keystore that is not there", signerAuto, 26, filepath.Join(dir, "absent.p12"), false, signerJVM},
+		{"auto leaves a bundle to jarsigner", signerAuto, 26, p12, true, signerJVM},
 	}
 	for _, c := range cases {
-		if got := resolveSigner(c.signer, c.key, c.aab); got != c.want {
+		if got := resolveSigner(c.signer, c.api, c.key, c.aab); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+
+	// the default is the resolver and not a backend: a build that says nothing has to
+	// get the answer that looks at its own manifest and keystore, and run and watch
+	// forward the flag only when the user named one, which is the same decision
+	if got := flagSignerDefault(t); got != signerDefault || signerDefault != signerAuto {
+		t.Errorf("--signer has to default to auto, it defaults to %q", got)
 	}
 
 	// the two formats have to be told apart by what a reader can see without a JVM,
@@ -408,4 +423,18 @@ func TestRSAKeyNamesTheAlgorithmItRefuses(t *testing.T) {
 	if _, err := rsaKey(small); err == nil || !strings.Contains(err.Error(), "2048") {
 		t.Errorf("a 1024 bit key must be refused with its size, got %v", err)
 	}
+}
+
+// flagSignerDefault reads the value --signer takes when the command line says nothing.
+// It is the other half of the default: run and watch forward the flag to the build they
+// start only when what the user asked for is not this, so a flip that moved one and not
+// the other would make an explicit --signer=jvm quietly become auto.
+func flagSignerDefault(t *testing.T) string {
+	t.Helper()
+	set := flag.NewFlagSet("build", flag.ContinueOnError)
+	f := registerBuildFlags(set, true)
+	if err := set.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	return *f.signer
 }

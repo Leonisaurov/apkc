@@ -44,16 +44,14 @@ $ cd myapp
 
 $ apkc build
 
-[build] compiling res/layout/main.xml 
-[build] compiling res/values/styles.xml 
+[sign] --signer=auto: go signs this package, no zipalign and no apksigner 
+[build] compiling resources 
 [build] bundling resources 
 [build] compiling java files 
-[build] bundling classes and jars 
-[build] bundling native libs 
-[build] no native libs 
-[build] signing apk 
-[build] running zipalign 
-[apkc] finished in 1.580135483s
+[build] bundling classes 
+[build] packaging and signing inside apkc 
+[sign] keystore /data/data/com.termux/files/home/.android/debug.keystore alias androiddebugkey certificate Android Debug valid to 2054-01-23 mac algorithm 2.16.840.1.101.3.4.2.1 
+[apkc] finished in 5.781396846s
 
 $ apkc run
 
@@ -139,7 +137,7 @@ A real edit forces the link, which is what embeds the merged manifest into the p
 
 Whether the app classes have to be dexed again, and whether the package has to carry other dependency dex files, are two different questions, and until now one flag answered both: any change in `jar/` forced `d8` over the project's own classes as well. So an `add` or a `remove` whose buckets were already cached paid the 8s of a `d8` pass over sources that had not changed. The state separates them: a dependency fingerprint that differs from `dexInputs` rebuilds the package, and only below API 21 (where the jars really are inputs of the one merge) does it also re-dex the project.
 
-Measured on the 60 jar demo, removing a dependency and putting it back with its bucket already cached: 4.9s and 4.86s, of which `apksigner` is 4.6s and 4.7s. Before, each of those cycles also paid the project `d8` (7.97s to 8.52s) and a full package write. What is left there is the JVM that signs the apk, which a debug build cannot skip.
+Measured on the 60 jar demo, removing a dependency and putting it back with its bucket already cached: 4.9s and 4.86s, of which `apksigner` is 4.6s and 4.7s. Before, each of those cycles also paid the project `d8` (7.97s to 8.52s) and a full package write. What was left there was the JVM that signs the apk — which is exactly the part the default no longer starts: the four seconds of `apksigner` in those rows are the 2.0s to 3.7s that the alternating pairs above show disappearing, and they come back only with `--signer=jvm`.
 
 The same split exposed a bug below API 21 that nothing else could see: the fingerprint of `jar/` was only computed inside the bucketed branch, and `jar/` is not tracked by timestamps, so with `minSdkVersion` 19 adding a jar left its classes out of the apk and deleting one left them inside. `jar/*.jar` is now hashed on every incremental run at both api levels (98 ms for 60 jars), so at api 19 an added jar reaches `classes.dex` and a removed one leaves it.
 
@@ -149,7 +147,7 @@ When one of those tools exits 0 its output was discarded. That is exactly the ho
 
 ### `lib/` is packed the way the manifest says
 
-`android:extractNativeLibs` is not decoration: `"false"` promises the runtime can map a `.so` straight out of the apk, which only holds when the entry is **stored** (not deflated) and page aligned, while `"true"` — or the attribute being absent — means the package manager unpacks the libraries at install. apkc reads the attribute and packs `lib/` accordingly, asking `zipalign -p` for the page alignment when the libraries are stored. The round says which of the two it did, because the wrong pairing installs and then fails to load the library. Flipping the attribute rewrites those entries even though not one byte of any `.so` moved: an entry is recorded by its bytes *and* its method, and the roster of `lib/` carries the method too.
+`android:extractNativeLibs` is not decoration: `"false"` promises the runtime can map a `.so` straight out of the apk, which only holds when the entry is **stored** (not deflated) and page aligned, while `"true"` — or the attribute being absent — means the package manager unpacks the libraries at install. apkc reads the attribute and packs `lib/` accordingly. Where the alignment comes from depends on the backend: the Go one decides it while writing each entry, and the JVM one asks `zipalign -p` for it after the fact. The round says which of the two it did, because the wrong pairing installs and then fails to load the library. Flipping the attribute rewrites those entries even though not one byte of any `.so` moved: an entry is recorded by its bytes *and* its method, and the roster of `lib/` carries the method too.
 
 ### Kotlin takes the whole module
 
@@ -171,11 +169,13 @@ The cost is one extra `javac` per round in which a shape actually moved — meas
 
 ### The package can be aligned and signed without a JVM
 
-`--signer=go` (accepted by `build`, `run` and `watch`) writes `build/app.apk` from the plan with the alignment of every entry decided as it is written, and appends an APK Signing Block holding an APK Signature Scheme v2 signature computed here: `zipalign` and `apksigner` never start, and the package is not rewritten a second time to move its uncompressed entries onto a boundary. Measured on a demo with one source edited per round, three alternating pairs: 7.39 s, 7.42 s and 7.85 s with the JVM tools against 5.52 s, 5.60 s and 5.62 s with the Go packager, and `apksigner verify --verbose` reports `Verified using v2 scheme: true` for every one of them.
+`--signer` takes `auto` (the default), `go` or `jvm`. `go` writes `build/app.apk` from the plan with the alignment of every entry decided as it is written, and appends an APK Signing Block holding an APK Signature Scheme v2 signature computed here: `zipalign` and `apksigner` never start, and the package is not rewritten a second time to move its uncompressed entries onto a boundary. Measured on a demo with one source edited per round, three alternating pairs: 7.39 s, 7.42 s and 7.85 s with the JVM tools against 5.52 s, 5.60 s and 5.62 s with the Go packager, and `apksigner verify --verbose` reports `Verified using v2 scheme: true` for every one of them.
+
+On three real projects, one source edited per round and the two backends alternating so the heat of the phone is shared between them: **7.1 s against 11.0 s** on the 135 MB one (the difference is exactly the `zipalign` 0.2 s and the `apksigner` 3.7 s the other path pays), 7.1 s against 9.4 s on the sixty dependency-jar one, and 5.9 s against a noisy 5.0 to 7.8 s on a small one. The saving is the size of the package: a 1 MB apk barely pays a signer, a 135 MB one pays four seconds.
 
 The device part of that claim: on Android 12 with `minSdkVersion=26`, the package this packager wrote installed and ran, and `dumpsys package` reported `signatures=PackageSignatures{… version:2 …}` for it. Then the same project built with `--signer=jvm` **updated it in place**, which only happens when the two sign with the same key — the certificate inside the block is the debug one, `611499de…` by digest, what `keytool` prints for the keystore.
 
-The default is still `--signer=jvm`, and `--signer=auto` is what a wrapper should pass: it takes the Go path whenever the packager can serve the project and the JVM path when it cannot, saying which it chose and why at debug level. One reason is left for the JVM path, not two — a bundle, assembled by `bundletool` and signed by `jarsigner`, and a **JKS** keystore, which the reader in here does not open and whose refusal names `keytool -importkeystore -storetype PKCS12` as the way out. The api level stopped being a reason when the packager learned to write the JAR signature.
+The default is `--signer=auto`: it takes the Go path unless one of three facts says it cannot, and logs which it chose and why. A **bundle** is assembled by `bundletool` and signed by `jarsigner`, a **JKS** keystore is a format the reader in here does not open — its refusal names `keytool -importkeystore -storetype PKCS12` as the way out — and a project whose `minSdkVersion` is below **18** is verified by a platform that reads SHA-1 jar digests and only those, which is the line `apksigner` itself draws when it decides to add the SHA-1 pairs. An explicit `--signer=go` is not second-guessed by any of the three: whoever names a backend gets that backend and its error. `run` and `watch` forward the flag to the build they start only when the user named one, so the default is decided in one place.
 
 What the Go packager writes is the JAR signature (v1) and the v2 block. Its three files — `META-INF/ANDROID.SF`, `META-INF/ANDROID.RSA`, `META-INF/MANIFEST.MF`, in that order — are produced here: one manifest section per packaged file with the SHA-256 of the bytes it holds, one `.SF` section per manifest section with the SHA-256 of those bytes, and a PKCS#7 `SignedData` carrying the certificate and an RSASSA-PKCS1-v1.5 signature over exactly the `.SF`. Long attribute values fold the way `java.util.jar` folds them — 72 bytes, then a space and up to 71 more — because a verifier digests a section as it would write it back, and an asset path over that length is not exotic.
 
@@ -185,7 +185,7 @@ Three oracles read the result: `apksigner verify --min-sdk-version 21` reports `
 
 The JVM path read by the same oracles, for the record: `jarsigner` cannot open a `--signer=jvm` apk at all — `ZipException: only DEFLATED entries can have EXT descriptor` — because that package carries `resources.arsc` stored with the data-descriptor bit of its local header set, the one combination the format forbids. It is inherited, not new: the bundle writer this tool came with hands every uncompressed entry to `archive/zip`, which cannot know a size before it has copied the bytes and so sets the bit, and `zipalign` and `apksigner` keep what they are given. Android and the build-tools read the result without complaint, which is why nothing said so until a JDK reader was pointed at it. The Go packager does not have it, because it writes each header with the sizes and the CRC it computed while writing.
 
-What it does not write: v3, and the SHA-1 digest pairs `apksigner` adds below `minSdkVersion` 21. A v3 signature is about key rotation and Play re-signs for distribution; the SHA-1 half cannot be tried on any device here, so a project of that age is signed the way a platform of that era reads a SHA-256 manifest and is otherwise unproven. `--aab` keeps the JVM path, since a bundle is assembled by `bundletool` and signed by `jarsigner`. The key comes straight from the PKCS#12 keystore — JKS and the pre-PBKDF2 encryption schemes are refused by name, with `--signer=jvm` in the message, because a second key derivation that cannot be tested here is not something a signing tool should guess at.
+What it does not write: v3, and the SHA-1 digest pairs a platform older than 4.3 reads. A v3 signature is about key rotation and Play re-signs for distribution; the SHA-1 half cannot be tried on any device here, so it is not written and `auto` hands those projects to the backend that has been shipping it. `--aab` stays on the JVM path for the same reason: a bundle is not this packager's output format. The key comes straight from the PKCS#12 keystore — JKS and the pre-PBKDF2 encryption schemes are refused by name, with `--signer=jvm` in the message, because a second key derivation that cannot be tested here is not something a signing tool should guess at.
 
 `--keyalias` selects a keystore entry by the name the file gives it, and that name is not in one place: `keytool` writes it inside a `SET OF` under a pkcs-9 id, and `openssl` under the Microsoft CSP id. Both spellings are read, and a key is paired with the certificate that carries its public key rather than with whichever bag came first — an apk signed with one entry and shipped with another's certificate installs once and then fails every update. A keystore that names its entries and does not hold the one asked for is refused with the names it does have; a keystore with one unnamed key is used for it, which is what an `openssl`-produced `.p12` looks like.
 
@@ -211,7 +211,7 @@ One signing option was tried and reverted: `--align-file-size=false` avoids padd
 
 ### Measured on a real project
 
-60 dependency jars, 15 sources, 410 tracked files, `tcr -j 1`, one thing changed per run — with the split into six buckets, the apk carries `classes.dex` (project) plus `classes2.dex` … `classes7.dex` (buckets).
+60 dependency jars, 15 sources, 410 tracked files, `tcr -j 1`, one thing changed per run — with the split into six buckets, the apk carries `classes.dex` (project) plus `classes2.dex` … `classes7.dex` (buckets). The rows were measured while the JVM signer was the default, and each of them that reaches the package pays it: `zipalign` 0.2 s and `apksigner` 2 to 4 s, which is what `auto` no longer starts. They are also measured with the cpu capped by `tcr`, so a `javac` of 5.9s in the table and the same 15 sources through `javac` in 2.1s today are the same work at two different clocks; the pairs to read as comparable are the ones in this file that say *alternating*.
 
 | change | before the split | now |
 |---|---|---|
@@ -240,7 +240,7 @@ Building the six buckets the first time costs 4m38s; `apkc clean` deletes them w
 
 What is left when a source changes is `d8` on the project plus the package and the signature, ~18.5s measured. It does not get cheaper by pre-merging the six bucket dexes into one file: measured before, merging 49 separate dex files plus the app classes took 53s, pre-merging the 49 into a single dex took 36s once and then 40s to merge that one with the app classes. The cost is in producing the multi-MB output dex, not in the number of inputs.
 
-The one remaining cut on a source edit would be bucketing the project's own classes the way `jar/` is bucketed, so that only the bucket holding the edited file is dexed. Measured instead of built: `d8` over the project takes 7.97s to 8.52s on the 60 jar demo and 12.9s to 13.9s on the 142 MB one, where the project has 20 classes. A bucket that contains the edited class pays that JVM anyway, so what could be saved is the *other* buckets' share, and at these sizes that is a couple of seconds at best. Against that, the staleness hole is real and subtle: a class whose bytes did not change but whose desugaring depends on the *shape* of a class that did change, in another bucket, would keep its old dex and fail at runtime with no signal in the build. So the project is not bucketed, and the floor of a source edit stays what `d8`, `zipalign` and `apksigner` cost.
+The one remaining cut on a source edit would be bucketing the project's own classes the way `jar/` is bucketed, so that only the bucket holding the edited file is dexed. Measured instead of built: `d8` over the project takes 7.97s to 8.52s on the 60 jar demo and 12.9s to 13.9s on the 142 MB one, where the project has 20 classes. A bucket that contains the edited class pays that JVM anyway, so what could be saved is the *other* buckets' share, and at these sizes that is a couple of seconds at best. Against that, the staleness hole is real and subtle: a class whose bytes did not change but whose desugaring depends on the *shape* of a class that did change, in another bucket, would keep its old dex and fail at runtime with no signal in the build. So the project is not bucketed, and the floor of a source edit is what the two JVMs of the project itself cost: `javac` 2.0s and `d8` 4.5 to 4.9s measured alternating on the two bigger demos, with the package and its signature adding 0.4s under `auto` — and 2 to 4 more seconds of `apksigner` under `--signer=jvm`.
 
 Every stage that took more than 100 ms logs its time under `[timing]`, so a slow cycle can be blamed on a stage instead of on the total. When a stage runs that a reader would not expect, `[Incremental]` says why: how many files `javac` is about to recompile, and which generated file `aapt2` produced, changed or stopped producing.
 

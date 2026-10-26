@@ -87,7 +87,7 @@ func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
 	f.storePass = set.String("storepass", "android", "keystore password")
 	f.keyAlias = set.String("keyalias", "androiddebugkey", "key alias to use")
 	f.sigAlg = set.String("sigalg", "SHA256withRSA", "signature algorithm to use")
-	f.signer = set.String("signer", signerJVM, "packaging and signing backend: jvm (zipalign and apksigner), go (v1 and v2 written inside apkc, needs a PKCS#12 keystore), or auto (go whenever it can, jvm otherwise)")
+	f.signer = set.String("signer", signerDefault, "packaging and signing backend: auto (the default: go unless the project needs a bundle, a JKS keystore or SHA-1 jar digests), go (zipalign and apksigner never start), jvm (zipalign and apksigner)")
 	return f
 }
 
@@ -132,7 +132,7 @@ func _build(o buildOpts) {
 
 	// who writes the apk is decided by the api level and the keystore in front of it,
 	// before any stage asks: --signer=auto means exactly that
-	o.signer = resolveSigner(o.signer, o.keyStore, o.useAAB)
+	o.signer = resolveSigner(o.signer, api, o.keyStore, o.useAAB)
 
 	var typeChanged, resStale, classStale, manifestStale, apiChanged bool
 	firstRun := false
