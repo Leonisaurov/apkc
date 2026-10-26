@@ -25,11 +25,11 @@ import (
 )
 
 // signer choices. go is the one that keeps a round from starting two JVMs; jvm is the
-// one with years of production behind it and the only one that reads a JKS keystore,
-// assembles a bundle or signs a package the way a platform older than 4.3 reads one.
-// signerDefault is what a build uses when the command line says nothing, and auto is
-// the answer that lets the facts that decide the backend speak instead of a guess made
-// once per project by whoever wrote the wrapper.
+// one with years of production behind it and the only one that assembles a bundle, opens
+// a keystore format the readers here do not know, or signs a package the way a platform
+// older than 4.3 reads one. signerDefault is what a build uses when the command line says
+// nothing, and auto is the answer that lets the facts that decide the backend speak
+// instead of a guess made once per project by whoever wrote the wrapper.
 const (
 	signerJVM     = "jvm"
 	signerGo      = "go"
@@ -47,9 +47,9 @@ const minAPIForSHA256Digest = 18
 
 // resolveSigner turns the choice on the command line into the backend this build can
 // actually use. The three things it checks are the three limits of the Go packager: a
-// bundle is assembled and signed by other tools, a JKS keystore is a format it refuses
-// to read, and a package under API 18 is verified by a platform that cannot read the
-// digests it writes.
+// bundle is assembled and signed by other tools, a keystore can be a format neither
+// reader here opens, and a package under API 18 is verified by a platform that cannot
+// read the digests it writes.
 //
 // Only a refusal is logged. The round that takes the Go path says so later, at the stage
 // that writes the package, and a watcher that resolves the same answer every round has
@@ -66,8 +66,8 @@ func resolveSigner(signer string, api int, keyPath string, useAAB bool) string {
 	case useAAB:
 		LogD("sign", "--signer=auto: a bundle is signed by jarsigner, so the jvm backend it is")
 		return signerJVM
-	case !keystoreIsPKCS12(keyPath):
-		LogD("sign", "--signer=auto:", keyPath, "is not a PKCS#12 keystore, and only the jvm backend reads the rest")
+	case !keystoreIsReadable(keyPath):
+		LogD("sign", "--signer=auto:", keyPath, "is neither a PKCS#12 nor a JKS keystore, and only the jvm backend reads the rest")
 		return signerJVM
 	case api < minAPIForSHA256Digest:
 		LogD("sign", "--signer=auto: minSdkVersion", api, "is old enough that its platform reads SHA-1 jar digests, which only apksigner writes")
@@ -103,7 +103,7 @@ func packageWithGo(plan []bundleEntry, recorded map[string]string, keyPath, stor
 	defer out.Close()
 
 	reuse, entries := reusePlan(plan, previous.names, recorded)
-	records, reused, digests, err := writePackageEntries(out, plan, reuse, previous, DataTable.EntrySha256)
+	records, reused, digests, err := writePackageEntries(out, plan, reuse, previous, DataTable.EntrySha256, true)
 	if err != nil {
 		return 0, err
 	}

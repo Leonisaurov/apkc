@@ -46,7 +46,7 @@ func TestHeadersOfAWrittenEntryAgreeWithItsDirectoryRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := []bundleEntry{{src: src, name: "assets/payload", compress: false, digest: "d1"}}
-	records, reused, digests, err := writePackageEntries(out, plan, []bool{false}, nil, map[string]string{})
+	records, reused, digests, err := writePackageEntries(out, plan, []bool{false}, nil, map[string]string{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestStoredEntryKeepsItsBytesAndCrc(t *testing.T) {
 	}
 
 	plan := []bundleEntry{{src: src, name: "lib/arm64-v8a/libx.so", compress: false, digest: "d"}}
-	records, _, _, err := writePackageEntries(out, plan, []bool{false}, nil, nil)
+	records, _, _, err := writePackageEntries(out, plan, []bool{false}, nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,5 +177,69 @@ func TestIsNativeLibLooksAtTheFirstDirectory(t *testing.T) {
 		if got := isNativeLib(name); got != want {
 			t.Errorf("isNativeLib(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// TestBundleEntriesWithoutSigningStayLegal is the reason a bundle and an apk are written
+// by one code: the descriptor bit that made java.util.zip refuse every apk the JVM path
+// produced came from the writer that path used, not from what it wrote. So the same
+// writer has to produce the same legal local headers when nobody is going to sign inside
+// apkc, and it has to skip the SHA-256 it would only throw away.
+func TestBundleEntriesWithoutSigningStayLegal(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "resources.arsc")
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = 'a'
+	}
+	if err := os.WriteFile(src, payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.Create(filepath.Join(dir, "bundle.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a stored entry is the one the format forbids with a data descriptor
+	plan := []bundleEntry{{src: src, name: "resources.arsc", compress: false, digest: "d1"}}
+	records, _, digests, err := writePackageEntries(out, plan, []bool{false}, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cd, eocd := centralDirectory(records, uint32(len(payload))+64)
+	if _, err := out.Write(cd); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Write(eocd); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if digests["resources.arsc"] != "" {
+		t.Errorf("a package nobody signs inside apkc does not need a content digest, got %q",
+			digests["resources.arsc"])
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "bundle.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw[0:4]) != "PK\x03\x04" {
+		t.Fatalf("the file does not begin with a local header: %q", raw[0:4])
+	}
+	flags := binary.LittleEndian.Uint16(raw[6:])
+	method := binary.LittleEndian.Uint16(raw[8:])
+	if flags&0x8 != 0 {
+		t.Errorf("a stored entry carries the data-descriptor bit, which java.util.zip refuses: flags 0x%x", flags)
+	}
+	if method != 0 {
+		t.Errorf("the plan asked for stored, the header says %d", method)
+	}
+	// and the sizes it does carry are the truth, since a streaming reader has nothing else
+	csize := binary.LittleEndian.Uint32(raw[18:])
+	usize := binary.LittleEndian.Uint32(raw[22:])
+	if csize != uint32(len(payload)) || usize != uint32(len(payload)) {
+		t.Errorf("a stored entry has to claim its own size in the local header: %d and %d, want %d",
+			csize, usize, len(payload))
 	}
 }

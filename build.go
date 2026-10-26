@@ -87,7 +87,7 @@ func registerBuildFlags(set *flag.FlagSet, withAAB bool) buildFlags {
 	f.storePass = set.String("storepass", "android", "keystore password")
 	f.keyAlias = set.String("keyalias", "androiddebugkey", "key alias to use")
 	f.sigAlg = set.String("sigalg", "SHA256withRSA", "signature algorithm to use")
-	f.signer = set.String("signer", signerDefault, "packaging and signing backend: auto (the default: go unless the project needs a bundle, a JKS keystore or SHA-1 jar digests), go (zipalign and apksigner never start), jvm (zipalign and apksigner)")
+	f.signer = set.String("signer", signerDefault, "packaging and signing backend: auto (the default: go unless the project builds a bundle, uses a keystore format apkc cannot read, or targets a platform older than 4.3), go (zipalign and apksigner never start), jvm (zipalign and apksigner)")
 	return f
 }
 
@@ -1406,6 +1406,8 @@ type nativeLibs struct {
 // recompressing a hundred and thirty six megabytes of assets that did not change.
 // The new package goes through a temporary file and a rename, because the previous one
 // is still open as the source of those raw copies while this one is being written.
+// It is the same writer that produces an apk, so both paths describe an entry the same
+// way to whoever reads it afterwards: zipalign and apksigner get a file a JDK can open.
 // packagePlan is the list of files the package is made of, in the order they go in.
 // Both packagers read it: the JVM one writes it into bundle.zip for zipalign and
 // apksigner to rewrite afterwards, the Go one writes it straight into the apk with
@@ -1504,74 +1506,47 @@ func buildBundle(useAAB bool, depDexes []string, auxDigests map[string]string, l
 	// opened before anything is written: the old package is the source of the raw
 	// copies, and it must keep its bytes while the new one is being built
 	packed := filepath.Join("build", "bundle.zip")
-	// no previous package, or one this build cannot read, only matters through
-	// prevErr: then every entry is written from its source, as a cold bundle does
-	previous, prevErr := zip.OpenReader(packed)
+	// opened before anything is written: the old bundle is the source of the raw
+	// copies, and it must keep its bytes while the new one is being built
+	previous, err := openPreviousPackage(packed)
+	if err != nil {
+		LogF("build", err, packed)
+	}
+	defer previous.Close()
 
 	outFile, err := os.Create(packed + ".tmp")
 	if err != nil {
 		LogF("build", err)
 	}
 
-	w := zip.NewWriter(outFile)
-
-	addFileToZip := func(s, d string, compress bool) {
-		var dst io.Writer
-		if compress {
-			dst, err = w.Create(d)
-		} else {
-			dst, err = w.CreateHeader(&zip.FileHeader{
-				Name:   d,
-				Method: zip.Store,
-			})
-		}
-		if err != nil {
-			LogF("build", err)
-		}
-
-		src, err := os.Open(s)
-		if err != nil {
-			LogF("build", err)
-		}
-
-		_, err = io.Copy(dst, src)
-		if err != nil {
-			LogF("build", err)
-		}
-	}
-
-	byName := map[string]*zip.File{}
-	oldNames := map[string]bool{}
-	if prevErr == nil {
-		for _, f := range previous.File {
-			byName[f.Name] = f
-			oldNames[f.Name] = true
-		}
-	}
-	reuse, entries := reusePlan(plan, oldNames, DataTable.BundleEntries)
-	reused := 0
-	for i, entry := range plan {
-		if reuse[i] {
-			if err := w.Copy(byName[entry.name]); err != nil {
-				LogF("build", err, entry.name)
-			}
-			reused++
-			continue
-		}
-		addFileToZip(entry.src, entry.name, entry.compress)
+	// the same writer that produces an apk produces this: archive/zip hands every
+	// entry a data descriptor, which the format allows only for deflated ones, so a
+	// stored resources.arsc came out of here unreadable by java.util.zip.ZipFile --
+	// and jarsigner, on the one path whose apks those tools still have to read
+	reuse, entries := reusePlan(plan, previous.names, DataTable.BundleEntries)
+	records, reused, _, err := writePackageEntries(outFile, plan, reuse, previous, DataTable.BundleEntries, false)
+	if err != nil {
+		LogF("build", err, packed)
 	}
 	if reused > 0 {
 		LogD("build", "copied", reused, "entries from the previous package")
 	}
 
-	if err := w.Close(); err != nil {
+	// no signing block under a bundle: zipalign and apksigner are what put one in, and
+	// the end record has to point at the directory that follows it and nothing else
+	cdAt, err := outFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		LogF("build", err)
+	}
+	cd, eocd := centralDirectory(records, uint32(cdAt))
+	if _, err := outFile.Write(cd); err != nil {
+		LogF("build", err)
+	}
+	if _, err := outFile.Write(eocd); err != nil {
 		LogF("build", err)
 	}
 	if err := outFile.Close(); err != nil {
 		LogF("build", err)
-	}
-	if prevErr == nil {
-		previous.Close()
 	}
 	if err := os.Rename(packed+".tmp", packed); err != nil {
 		LogF("build", err)

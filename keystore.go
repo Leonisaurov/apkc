@@ -30,13 +30,19 @@ func signingKey(path, password, alias string) (crypto.Signer, *x509.Certificate,
 		return nil, nil, err
 	}
 
+	// Both formats a keytool writes are read here: PKCS#12 since JDK 9, JKS before it,
+	// and the two share nothing but the alias they name their entries with. Anything
+	// else -- a JCEKS store, a file that is not a keystore at all -- is refused by name,
+	// because guessing at a signing key is not a thing a signing tool does.
+	reader := readPKCS12
+	kind := "PKCS#12"
 	if isJKSHead(blob) {
-		return nil, nil, fmt.Errorf("%s is a JKS keystore: the Go signer reads PKCS#12, convert it with keytool -importkeystore -storetype PKCS12 or build with --signer=jvm", path)
+		reader, kind = readJKS, "JKS"
 	}
 
-	material, err := readPKCS12(blob, password, alias)
+	material, err := reader(blob, password, alias)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%s (%s): %v", path, kind, err)
 	}
 
 	// An entry is named by the friendlyName its bag carries, not by the subject of
@@ -56,11 +62,11 @@ func signingKey(path, password, alias string) (crypto.Signer, *x509.Certificate,
 	return material.Signer, material.Cert, nil
 }
 
-// keystoreIsPKCS12 answers what the Go signer can open without reading the key:
-// PKCS#12 is an ASN.1 SEQUENCE, so its first byte is 0x30, while JKS starts with the
-// magic below. The name inside the file is no help, keytool writes both formats with
-// the same extension, and a debug keystore of one JDK is a PKCS#12 of the next.
-func keystoreIsPKCS12(path string) bool {
+// keystoreIsReadable is what --signer=auto asks before committing a package to the Go
+// signer: not "which format is it" but "is it one the readers in here open without a
+// JVM". A JCEKS store, or a file that is not a keystore at all, is neither, and the
+// refusal says so by the first four bytes rather than by a stack of parse errors.
+func keystoreIsReadable(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
@@ -71,9 +77,13 @@ func keystoreIsPKCS12(path string) bool {
 	if _, err := io.ReadFull(f, head[:]); err != nil {
 		return false
 	}
-	// a PKCS#12 file is an ASN.1 SEQUENCE: 0x30 in front and no JKS magic, which is
-	// what the two formats have to tell each other apart by
-	return head[0] == 0x30 && !isJKSHead(head[:])
+	return keystoreHeadIsReadable(head[:])
+}
+
+// keystoreHeadIsReadable is the same question on the four bytes themselves, so a test
+// can ask it without a file on disk.
+func keystoreHeadIsReadable(head []byte) bool {
+	return isJKSHead(head) || (len(head) > 0 && head[0] == 0x30)
 }
 
 // rsaKey narrows the signer to the algorithm a debug keystore uses, so an

@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"math/big"
@@ -282,11 +283,39 @@ func TestSigningKeyWrongPasswordIsNamedAsAPasswordProblem(t *testing.T) {
 	}
 }
 
-func TestSigningKeyRefusesJKSInsteadOfMisreadingIt(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.jks")
+// TestSigningKeyChoosesTheReaderByTheHeader is what the extension cannot answer: keytool
+// wrote JKS until JDK 8 and PKCS#12 since, and a file called debug.keystore can be either
+// one on the same machine. A store with the JKS magic has to be opened by the JKS reader
+// and answered with its key, not refused or handed to the PKCS#12 one.
+func TestSigningKeyChoosesTheReaderByTheHeader(t *testing.T) {
+	dir := t.TempDir()
+	blob, err := base64.StdEncoding.DecodeString(jksFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "debug.keystore")
+	if err := os.WriteFile(path, blob, 0600); err != nil {
+		t.Fatal(err)
+	}
 
-	// the JKS header followed by anything: stopping at the format is worth more
-	// than a decode error that reads like a corrupt file
+	signer, cert, err := signingKey(path, "android", "androiddebugkey")
+	if err != nil {
+		t.Fatalf("a real keytool JKS store was refused: %v", err)
+	}
+	if signer == nil || cert == nil {
+		t.Fatal("the JKS reader answered with nothing to sign with")
+	}
+	if cert.Subject.CommonName != "Test JKS" {
+		t.Errorf("the certificate that came with the key is %q, not the one the store holds",
+			cert.Subject.CommonName)
+	}
+}
+
+// TestSigningKeyNamesTheFileItCouldNotRead: a store that begins like a JKS and is not one
+// has to be reported as that file and that reason. The old refusal to touch the format at
+// all is gone, so what is left to promise is that nothing gets blamed on the other reader.
+func TestSigningKeyNamesTheFileItCouldNotRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broken.jks")
 	blob := append([]byte{0xFE, 0xED, 0xFE, 0xED}, make([]byte, 64)...)
 	if err := os.WriteFile(path, blob, 0600); err != nil {
 		t.Fatal(err)
@@ -294,12 +323,15 @@ func TestSigningKeyRefusesJKSInsteadOfMisreadingIt(t *testing.T) {
 
 	_, _, err := signingKey(path, "android", "androiddebugkey")
 	if err == nil {
-		t.Fatal("a JKS keystore was accepted by a PKCS#12 reader")
+		t.Fatal("a file that is only a JKS header opened as a keystore")
 	}
-	for _, want := range []string{"JKS", "--signer=jvm"} {
+	for _, want := range []string{"broken.jks", "JKS"} {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the error must name %q so the user knows what to do, got %v", want, err)
+			t.Errorf("the error has to name %q so the user knows which file and which format, got %v", want, err)
 		}
+	}
+	if strings.Contains(err.Error(), "PKCS#12") {
+		t.Errorf("a JKS file was answered with a PKCS#12 diagnosis: %v", err)
 	}
 }
 
@@ -352,7 +384,10 @@ func TestResolveSigner(t *testing.T) {
 	dir := t.TempDir()
 	p12 := filepath.Join(dir, "release.p12")
 	jks := filepath.Join(dir, "old.jks")
-	for path, head := range map[string][]byte{p12: {0x30, 0x82, 0x01, 0x02}, jks: {0xFE, 0xED, 0xFE, 0xED}} {
+	jceks := filepath.Join(dir, "old.jceks")
+	// JCEKS is the third thing keytool could have written, and its magic is neither
+	// an ASN.1 SEQUENCE nor the JKS one
+	for path, head := range map[string][]byte{p12: {0x30, 0x82, 0x01, 0x02}, jks: {0xFE, 0xED, 0xFE, 0xED}, jceks: {0xCE, 0xCE, 0xCE, 0xCE}} {
 		if err := os.WriteFile(path, append(head, make([]byte, 16)...), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -373,8 +408,9 @@ func TestResolveSigner(t *testing.T) {
 		{"auto takes it at the boundary too", signerAuto, minAPIForSHA256Digest, p12, false, signerGo},
 		{"auto refuses the SHA-1 strip below it", signerAuto, minAPIForSHA256Digest - 1, p12, false, signerJVM},
 		{"auto refuses a manifest that names no minSdkVersion", signerAuto, 0, p12, false, signerJVM},
-		{"auto refuses a JKS keystore", signerAuto, 26, jks, false, signerJVM},
+		{"auto takes a JKS keystore now that the reader opens one", signerAuto, 26, jks, false, signerGo},
 		{"auto refuses a keystore that is not there", signerAuto, 26, filepath.Join(dir, "absent.p12"), false, signerJVM},
+		{"auto refuses a format neither reader opens", signerAuto, 26, jceks, false, signerJVM},
 		{"auto leaves a bundle to jarsigner", signerAuto, 26, p12, true, signerJVM},
 	}
 	for _, c := range cases {
@@ -390,16 +426,18 @@ func TestResolveSigner(t *testing.T) {
 		t.Errorf("--signer has to default to auto, it defaults to %q", got)
 	}
 
-	// the two formats have to be told apart by what a reader can see without a JVM,
-	// because both arrive with the same extension and under the same name
-	if !keystoreIsPKCS12(p12) {
-		t.Error("a PKCS#12 header was not recognised")
+	// what a reader can see without a JVM decides the backend, and both formats arrive
+	// under the same extension with nothing in the name to tell them apart
+	for _, path := range []string{p12, jks} {
+		if !keystoreIsReadable(path) {
+			t.Errorf("%s is a keystore apkc signs with, and it was reported unreadable", filepath.Base(path))
+		}
 	}
-	if keystoreIsPKCS12(jks) {
-		t.Error("a JKS header was read as PKCS#12")
+	if keystoreIsReadable(jceks) {
+		t.Error("a JCEKS store is not something the readers here open")
 	}
-	if keystoreIsPKCS12(filepath.Join(dir, "absent.p12")) {
-		t.Error("a file that is not there cannot be a keystore format")
+	if keystoreIsReadable(filepath.Join(dir, "absent.p12")) {
+		t.Error("a file that is not there cannot be a readable keystore")
 	}
 }
 

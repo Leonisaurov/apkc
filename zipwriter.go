@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"hash"
 	"hash/crc32"
 	"io"
 	"os"
@@ -97,9 +98,12 @@ type prevEntry struct {
 }
 
 // writePackageEntries puts every entry of the plan into dst. reuse[i] says the entry
-// is unchanged since the previous package, and prev holds that package.
+// is unchanged since the previous package, and prev holds that package. signs says the
+// package will carry a signature written here, which is the only reason an entry's
+// SHA-256 is worth computing at all: a bundle goes to zipalign and apksigner, and those
+// read the entries they hash from the archive again.
 func writePackageEntries(dst *os.File, plan []bundleEntry, reuse []bool, prev *previousPackage,
-	cached map[string]string) ([]packedRecord, int, map[string]string, error) {
+	cached map[string]string, signs bool) ([]packedRecord, int, map[string]string, error) {
 	records := make([]packedRecord, 0, len(plan))
 	digests := make(map[string]string, len(plan))
 	reused := 0
@@ -151,7 +155,7 @@ func writePackageEntries(dst *os.File, plan []bundleEntry, reuse []bool, prev *p
 			rec, err = copyStored(dst, prev.file, e.name, offset, when, p)
 			digests[e.name] = cached[e.name]
 		} else {
-			rec, digests[e.name], err = writeFromFile(dst, e, offset, when)
+			rec, digests[e.name], err = writeFromFile(dst, e, offset, when, signs)
 		}
 		if err != nil {
 			return nil, 0, nil, err
@@ -238,8 +242,9 @@ func copyStored(dst *os.File, prevFile *os.File, name string, headerOff int64, w
 
 // writeFromFile takes an entry from the tree: deflated when the plan says so, and
 // with the crc and the sizes patched into the header once the data is through, which
-// is the first moment they can be known.
-func writeFromFile(dst *os.File, e bundleEntry, headerOff int64, when uint32) (packedRecord, string, error) {
+// is the first moment they can be known. When signs is false the SHA-256 is not
+// computed and the second return value stays empty.
+func writeFromFile(dst *os.File, e bundleEntry, headerOff int64, when uint32, signs bool) (packedRecord, string, error) {
 	src, err := os.Open(e.src)
 	if err != nil {
 		return packedRecord{}, "", err
@@ -252,13 +257,17 @@ func writeFromFile(dst *os.File, e bundleEntry, headerOff int64, when uint32) (p
 	}
 
 	counted := &countingWriter{w: dst}
-	digest := crc32.NewIEEE()
-	// the same bytes go into a SHA-256 as well: the JAR signature digests what an
-	// entry holds, not how it was carried, so this is the one pass that can produce
-	// both without reading the file twice
-	content := sha256.New()
-	source := io.TeeReader(src, io.MultiWriter(digest, content))
-	packed := int64(0)
+	crc := crc32.NewIEEE()
+	// the same bytes go into a SHA-256 as well when the package signs itself: the JAR
+	// signature digests what an entry holds, not how it was carried, so this is the one
+	// pass that can produce both without reading the file twice
+	var content hash.Hash
+	sink := io.Writer(crc)
+	if signs {
+		content = sha256.New()
+		sink = io.MultiWriter(crc, content)
+	}
+	source := io.TeeReader(src, sink)
 	if e.compress {
 		packer, err := flate.NewWriter(counted, flate.DefaultCompression)
 		if err != nil {
@@ -274,28 +283,30 @@ func writeFromFile(dst *os.File, e bundleEntry, headerOff int64, when uint32) (p
 	} else if _, err := io.Copy(counted, source); err != nil {
 		return packedRecord{}, "", err
 	}
-	packed = counted.n
 
-	crc := digest.Sum32()
 	usize := uint32(info.Size())
-	csize := uint32(packed)
+	csize := uint32(counted.n)
 	if !e.compress {
 		// a stored entry is its own compression, and the byte count that went out is
 		// the size the record claims
 		csize = usize
 	}
-	if err := patchHeader(dst, headerOff, crc, csize, usize); err != nil {
+	if err := patchHeader(dst, headerOff, crc.Sum32(), csize, usize); err != nil {
 		return packedRecord{}, "", err
+	}
+	digest := ""
+	if content != nil {
+		digest = base64.StdEncoding.EncodeToString(content.Sum(nil))
 	}
 	return packedRecord{
 		name:     e.name,
 		offset:   headerOff,
-		crc:      crc,
+		crc:      crc.Sum32(),
 		csize:    csize,
 		usize:    usize,
 		deflate:  e.compress,
 		dateTime: when,
-	}, base64.StdEncoding.EncodeToString(content.Sum(nil)), nil
+	}, digest, nil
 }
 
 func makeHeader(name string, deflate bool, extra, crc, csize, usize, dateTime uint32) []byte {
