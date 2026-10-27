@@ -310,14 +310,22 @@ func _build(o buildOpts) {
 	// A plain build always runs them: a caller of `apkc build` without --inc judges
 	// the build by the apk being rewritten, and that signal is not worth losing
 	// because a package happened to match by accident.
+	// Signing needs the keystore, and only this branch knows whether the round will sign:
+	// an idle incremental round leaves the apk on disk and never opens the store, so the
+	// check belongs with the writing rather than with the flags. It is in front of both
+	// backends on purpose. A path that is not there is not a question about which format
+	// apkc can read: the JVM one answers it with a Java stack trace over a path the user
+	// already typed, and the Go one with a bare "open ...: no such file".
+	apkOk := exists(filepath.Join("build", "app.apk"))
 	if o.useAAB {
 		if needBundle || !exists("build/app.aab") {
+			requireKeystore(o.keyStore)
 			buildAAB()
 			signAAB(o.keyStore, o.storePass, o.keyAlias, o.sigAlg)
 		}
 	} else if o.signer == signerGo {
-		apkOk := exists(filepath.Join("build", "app.apk"))
 		if needBundle || !apkOk {
+			requireKeystore(o.keyStore)
 			defer timeIt("package and sign go")()
 			LogI("build", "packaging and signing inside apkc")
 			plan := packagePlan(o.useAAB, depDexes, auxDigests, libs)
@@ -339,8 +347,8 @@ func _build(o buildOpts) {
 			// digest empty forces align and sign again
 			bundleSha, _ = fileSHA1(packed)
 		}
-		apkOk := exists(filepath.Join("build", "app.apk"))
 		if mustPackageAgain(o.incremental, apkOk, bundleSha, DataTable.BundleSha1) {
+			requireKeystore(o.keyStore)
 			alignAPK(libs.stored)
 			signAPK(o.keyStore, o.storePass, o.keyAlias)
 			if o.incremental {
@@ -374,17 +382,45 @@ func clean() {
 	os.RemoveAll("build")
 }
 
-// prepare verifies the project paths and setup the build dir
-func prepare() {
-	mustExist := func(path string) {
-		if _, err := os.Stat(path); err != nil {
-			LogF("build", err)
+// projectPieces are the paths a directory has to hold for a build to mean anything.
+// They are looked for together and named together on purpose: whoever runs the command
+// one directory too high is missing all three, and a single os error about one of them
+// reads like a filesystem complaint instead of the one answer that matters — that there
+// is no project here.
+var projectPieces = []string{"AndroidManifest.xml", "src", "res"}
+
+func missingProjectPieces() []string {
+	missing := []string{}
+	for _, piece := range projectPieces {
+		if _, err := os.Stat(piece); err != nil {
+			missing = append(missing, piece)
 		}
 	}
+	return missing
+}
 
-	mustExist("src")
-	mustExist("res")
-	mustExist("AndroidManifest.xml")
+// andList puts the last name behind "and" because the list goes into a sentence.
+func andList(names []string) string {
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = "`" + n + "`"
+	}
+	switch len(quoted) {
+	case 0:
+		return ""
+	case 1:
+		return quoted[0]
+	default:
+		return strings.Join(quoted[:len(quoted)-1], ", ") + " and " + quoted[len(quoted)-1]
+	}
+}
+
+// prepare verifies the project paths and setup the build dir
+func prepare() {
+	if missing := missingProjectPieces(); len(missing) > 0 {
+		LogF("build", "there is no", andList(missing), "here, so this is not an apkc project:",
+			"`apkc create .` starts one, and a build runs in the directory that holds the manifest")
+	}
 
 	mustMkdir := func(path string) {
 		// only ignore if error is "already exist"

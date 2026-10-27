@@ -86,6 +86,19 @@ func keystoreHeadIsReadable(head []byte) bool {
 	return isJKSHead(head) || (len(head) > 0 && head[0] == 0x30)
 }
 
+// requireKeystore stops a round that is about to sign with a path that holds nothing.
+// Neither backend can do anything with a missing file, and neither says so in the terms
+// the flag was written with: apksigner answers with a Java stack trace naming a path the
+// user already typed, and the Go reader with a bare os error about opening it. This is
+// not the format refusal of --signer=auto, which is about what apkc can read; a file that
+// is not there is nobody's format, so it is fatal before the choice of backend matters.
+func requireKeystore(path string) {
+	if _, err := os.Stat(path); err != nil {
+		LogF("sign", "there is no keystore at", path, "- no package can be signed without it.",
+			"apkc doctor prints the path in use, and --keystore takes another one")
+	}
+}
+
 // rsaKey narrows the signer to the algorithm a debug keystore uses, so an
 // EC or Ed25519 key is refused by name instead of failing inside the format code
 // with a signature nobody can read.
