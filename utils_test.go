@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -475,5 +476,25 @@ func TestClasspathUsesThePlatformSeparator(t *testing.T) {
 	}
 	if strings.Contains(joined, "android.jar"+string(filepath.ListSeparator)+"android.jar") {
 		t.Error("android.jar must be listed once")
+	}
+}
+
+func TestToolFailureKeepsTheReasonOfAToolThatNeverStarted(t *testing.T) {
+	// two failures reach the same if and are not the same message: a tool that ran and
+	// refused answers with its own text, and a tool that never started wrote nothing,
+	// so the only reason there is lives in the error
+	if got := toolFailure("javac", []byte("error: cannot find symbol\n"), errors.New("exit status 1")); got != "error: cannot find symbol" {
+		t.Errorf("a tool that ran must answer with its own text, got %q", got)
+	}
+
+	if got := toolFailure("d8", nil, errors.New("fork/exec /sdk/d8: permission denied")); !strings.Contains(got, "d8 never started") ||
+		!strings.Contains(got, "permission denied") {
+		t.Errorf("a tool that never started lost its reason, got %q", got)
+	}
+
+	// whitespace-only output is not an answer: this is the case that used to print
+	// "[build]  " and stop, which is what a js/wasm build hits at its first stage
+	if got := toolFailure("aapt2 compile", []byte("  \n\n"), errors.New(`exec: "": executable file not found in $PATH`)); !strings.Contains(got, "aapt2 compile never started") {
+		t.Errorf("empty output fell through to a blank line, got %q", got)
 	}
 }

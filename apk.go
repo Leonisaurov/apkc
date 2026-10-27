@@ -22,7 +22,7 @@ func alignAPK(pageAlign bool) {
 	cmd := exec.Command(zipAlignPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out))
+		LogF("build", toolFailure("zipalign", out, err), zipAlignPath)
 	}
 
 	// verify with: zipalign -c -v 4 build/app.apk
@@ -46,7 +46,7 @@ func signAPK(keyStore, storePass, keyAlias string) {
 	cmd := exec.Command(apksignerPath, "sign", "--ks-pass", "pass:"+storePass, "--ks", keyStore, "--ks-key-alias", keyAlias, filepath.Join("build", "app.apk"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out))
+		LogF("build", toolFailure("apksigner", out, err), apksignerPath)
 	}
 
 	// verify with: zipalign -c -v 4 build/app.apk and apksigner verify build/app.apk

@@ -447,7 +447,7 @@ func compileRes(incremental bool) bool {
 	cmd := exec.Command(aapt2Path, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out))
+		LogF("build", toolFailure("aapt2 compile", out, err))
 	}
 	if incremental {
 		updateRecords(res)
@@ -488,7 +488,7 @@ func bundleRes(useAAB bool, incremental bool) bool {
 	cmd := exec.Command(aapt2Path, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out))
+		LogF("build", toolFailure("aapt2 link", out, err))
 	}
 
 	if !incremental {
@@ -625,7 +625,7 @@ func compileKotlin(incremental bool) ([]string, bool) {
 	cmd := exec.Command(kotlincPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out), args)
+		LogF("build", toolFailure("kotlinc", out, err), args)
 	}
 	if len(out) > 0 {
 		LogW("kotlinc", string(out))
@@ -671,7 +671,7 @@ func compileJava(incremental bool) ([]string, bool) {
 	cmd := exec.Command(javacPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out), args)
+		LogF("build", toolFailure("javac", out, err), args)
 	}
 	// a compiler that exits 0 can still say something the build should not swallow:
 	// deprecation notes and unchecked warnings are the only notice a source edit gets
@@ -829,7 +829,7 @@ func bundleJava(api int, coreLibrary bool, jars []string, depsSplit bool, classe
 	cmd := exec.Command(d8Path, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out), d8Path, args)
+		LogF("build", toolFailure("d8", out, err), d8Path, args)
 	}
 	reportD8Drops(out)
 }

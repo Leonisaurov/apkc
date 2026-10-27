@@ -436,3 +436,16 @@ func copyFiles(src, dst string) error {
 		return err
 	})
 }
+
+// toolFailure is what a failed external tool has to say, and there are two different
+// answers here that the call sites used to collapse into one. A tool that ran and
+// refused wrote its reason into out. A tool that never started - an empty path out of
+// findSDKs, a js/wasm build with no fork/exec, a file without the exec bit - wrote
+// nothing at all, and its only reason is in err. Logging just out is therefore an empty
+// line, which is how a wasm build came to print "[build]  " and stop.
+func toolFailure(tool string, out []byte, err error) string {
+	if strings.TrimSpace(string(out)) == "" {
+		return tool + " never started: " + err.Error()
+	}
+	return strings.TrimRight(string(out), "\n")
+}

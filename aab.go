@@ -24,13 +24,13 @@ func buildAAB() {
 		args = append([]string{"-jar", bundletoolPath}, args...)
 		cmd := exec.Command(javaCmdPath, args...)
 		cmd.Dir = "build"
-		runOrAbort(cmd)
+		runOrAbort("bundletool", cmd)
 		return
 	}
 
 	cmd := exec.Command(bundletoolPath, args...)
 	cmd.Dir = "build"
-	runOrAbort(cmd)
+	runOrAbort("bundletool", cmd)
 }
 
 // signAAB signs the bundle with jarsigner. A bundle is not an apk: it is never
@@ -45,16 +45,18 @@ func signAAB(keyStore, storePass, keyAlias, sigAlg string) {
 
 	cmd := exec.Command(jarsignerPath, "-verbose", "-sigalg", sigAlg, "-digestalg", "SHA-256",
 		"-storepass", storePass, "-keystore", keyStore, filepath.Join("build", "app.aab"), keyAlias)
-	runOrAbort(cmd)
+	runOrAbort("jarsigner", cmd)
 }
 
 // runOrAbort runs a tool and shows its whole answer when it fails: a bundletool
 // refusal is a wall of text about the module set, and the last three lines of it
-// are not the reason.
-func runOrAbort(cmd *exec.Cmd) {
+// are not the reason. The tool is named by the caller because the path it was
+// resolved to is sometimes the empty string, and "did not run" without a name
+// leaves nothing to act on.
+func runOrAbort(tool string, cmd *exec.Cmd) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		LogF("build", string(out), cmd.Args[0])
+		LogF("build", toolFailure(tool, out, err), cmd.Args[0])
 	}
 	if len(out) > 0 {
 		LogD("build", string(out))
